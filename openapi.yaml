@@ -1,0 +1,1162 @@
+openapi: 3.1.0
+info:
+  title: Ogame-like Game Server
+  version: 1.0.0
+paths:
+  /auth/register:
+    post:
+      tags:
+      - auth
+      summary: Register
+      operationId: register_auth_register_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /auth/login:
+    post:
+      tags:
+      - auth
+      summary: Login
+      operationId: login_auth_login_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /auth/me:
+    get:
+      tags:
+      - auth
+      summary: Me
+      operationId: me_auth_me_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+      security:
+      - OAuth2PasswordBearer: []
+  /auth/logout:
+    post:
+      tags:
+      - auth
+      summary: Logout
+      operationId: logout_auth_logout_post
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+      security:
+      - OAuth2PasswordBearer: []
+  /metrics:
+    get:
+      summary: Get Metrics
+      operationId: get_metrics_metrics_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+  /:
+    get:
+      summary: Root
+      description: Simple health banner indicating server readiness.
+      operationId: root__get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+  /player/{user_id}:
+    get:
+      summary: Get Player
+      description: Get all data for a specific player.
+      operationId: get_player_player__user_id__get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /player/{user_id}/build:
+    post:
+      summary: Build Building
+      description: Queue a building for construction.
+      operationId: build_building_player__user_id__build_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              title: Building Data
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /player/{user_id}/buildings/{building_type}:
+    delete:
+      summary: Demolish Building
+      description: Demolish a building one level down, with partial refund and safety
+        checks.
+      operationId: demolish_building_player__user_id__buildings__building_type__delete
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      - name: building_type
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Building Type
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /player/{user_id}/build-queue/{index}:
+    delete:
+      summary: Cancel Build Queue
+      description: Cancel a pending build queue item and refund part of the cost.
+      operationId: cancel_build_queue_player__user_id__build_queue__index__delete
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      - name: index
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: Index
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /building-costs/{building_type}:
+    get:
+      summary: Get Building Costs
+      description: Get the cost to build/upgrade a specific building.
+      operationId: get_building_costs_building_costs__building_type__get
+      parameters:
+      - name: building_type
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Building Type
+      - name: level
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 0
+          title: Level
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /game-status:
+    get:
+      summary: Get Game Status
+      description: Get general game status information.
+      operationId: get_game_status_game_status_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+  /player/{user_id}/research:
+    get:
+      summary: Get Player Research
+      description: Return current research levels and research queue for the player.
+      operationId: get_player_research_player__user_id__research_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    post:
+      summary: Start Research
+      description: Queue a research job for the player.
+      operationId: start_research_player__user_id__research_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              title: Payload
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /healthz:
+    get:
+      summary: Healthz
+      description: Health check endpoint providing basic service metrics.
+      operationId: healthz_healthz_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+  /player/{user_id}/fleet:
+    get:
+      summary: Get Player Fleet
+      description: 'Get the player''s current fleet and ship build queue.
+
+
+        To improve determinism in tests, this endpoint will opportunistically
+
+        advance the ECS world one tick before reading data. This allows
+
+        ship builds that have reached their completion time to be applied
+
+        immediately when queried.'
+      operationId: get_player_fleet_player__user_id__fleet_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /player/{user_id}/build-ships:
+    post:
+      summary: Build Ships
+      description: 'Queue ship construction in the player''s shipyard.
+
+
+        Body example:
+
+        {"ship_type": "light_fighter", "quantity": 5}'
+      operationId: build_ships_player__user_id__build_ships_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              title: Payload
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /player/{user_id}/fleet/dispatch:
+    post:
+      summary: Dispatch Fleet
+      description: 'Dispatch a fleet from the active planet to target coordinates
+        with a mission.
+
+
+        Body example:
+
+        {"galaxy": 1, "system": 2, "position": 3, "mission": "attack", "speed": 1.0,
+        "ships": {"light_fighter": 5}}
+
+
+        For this initial task, the endpoint validates input and queues a command for
+        the
+
+        game loop to process. Detailed travel time calculations and composition handling
+
+        are part of subsequent tasks in docs/tasks.md.'
+      operationId: dispatch_fleet_player__user_id__fleet_dispatch_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              title: Payload
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /player/{user_id}/fleet/{fleet_id}/recall:
+    post:
+      summary: Recall Fleet
+      description: 'Recall an in-flight fleet back to its origin.
+
+
+        The current ECS model tracks at most one in-flight FleetMovement per player
+        entity.
+
+        The fleet_id parameter is accepted for API compatibility; selection among
+        multiple
+
+        concurrent fleets is not yet implemented.'
+      operationId: recall_fleet_player__user_id__fleet__fleet_id__recall_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      - name: fleet_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: Fleet Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /player/{user_id}/planets:
+    get:
+      summary: Get Player Planets
+      description: 'List all planets owned by the authenticated user.
+
+
+        When the database layer is enabled, this queries ORM planets by owner_id.
+
+        Otherwise, it falls back to the current ECS entity''s planet metadata.'
+      operationId: get_player_planets_player__user_id__planets_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /planets/available:
+    get:
+      summary: Get Available Planets
+      description: 'Return a list of uncolonized planet coordinates within the universe
+        bounds.
+
+
+        Optional filters:
+
+        - galaxy: restrict to a specific galaxy
+
+        - system: restrict to a specific system (requires galaxy or not; validated
+        against bounds)
+
+
+        Pagination:
+
+        - limit (default 50, max 1000)
+
+        - offset (default 0)'
+      operationId: get_available_planets_planets_available_get
+      parameters:
+      - name: galaxy
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: integer
+            minimum: 1
+          - type: 'null'
+          title: Galaxy
+      - name: system
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: integer
+            minimum: 1
+          - type: 'null'
+          title: System
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 1000
+          minimum: 1
+          default: 50
+          title: Limit
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+          title: Offset
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /player/{user_id}/choose-start:
+    post:
+      summary: Choose Start
+      description: 'Allow a newly registered user to choose a starting location.
+
+
+        Expects JSON payload containing:
+
+        - galaxy: int (required)
+
+        - system: int (required)
+
+        - position: int (optional) -> if omitted, the first free position in the system
+        is used
+
+        - name: str (optional) -> planet name; defaults from config
+
+
+        Constraints:
+
+        - Only allowed if the user currently owns zero planets.
+
+        - Coordinates must be within configured bounds and target position must be
+        unoccupied.'
+      operationId: choose_start_player__user_id__choose_start_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              title: Payload
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /player/{user_id}/planets/{planet_id}/select:
+    post:
+      summary: Select Active Planet
+      description: 'Switch the active planet for the authenticated user.
+
+
+        Requires the database layer to be enabled. If the planet does not belong to
+        the user
+
+        or cannot be loaded, returns 404.'
+      operationId: select_active_planet_player__user_id__planets__planet_id__select_post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      - name: planet_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: Planet Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /player/{user_id}/battle-reports:
+    get:
+      summary: List Battle Reports
+      description: 'List battle reports visible to the player (attacker or defender).
+
+
+        Pagination via limit/offset. Returns newest-first ordering.'
+      operationId: list_battle_reports_player__user_id__battle_reports_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 200
+          minimum: 1
+          default: 50
+          title: Limit
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+          title: Offset
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /player/{user_id}/battle-reports/{report_id}:
+    get:
+      summary: Get Battle Report
+      description: Retrieve a single battle report if the user is a participant.
+      operationId: get_battle_report_player__user_id__battle_reports__report_id__get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      - name: report_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: Report Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /player/{user_id}/espionage-reports:
+    get:
+      summary: List Espionage Reports
+      description: 'List espionage reports visible to the player (attacker or defender).
+
+
+        Pagination via limit/offset. Returns newest-first ordering.'
+      operationId: list_espionage_reports_player__user_id__espionage_reports_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 200
+          minimum: 1
+          default: 50
+          title: Limit
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+          title: Offset
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /player/{user_id}/espionage-reports/{report_id}:
+    get:
+      summary: Get Espionage Report
+      description: Retrieve a single espionage report if the user is a participant.
+      operationId: get_espionage_report_player__user_id__espionage_reports__report_id__get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      - name: report_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: Report Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /player/{user_id}/trade/history:
+    get:
+      summary: List Trade History
+      description: 'List the authenticated user''s trade history (offer_created and
+        trade_completed).
+
+
+        Newest-first, paginated via limit/offset.'
+      operationId: list_trade_history_player__user_id__trade_history_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 200
+          minimum: 1
+          default: 50
+          title: Limit
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+          title: Offset
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /trade/offers:
+    post:
+      summary: Create Trade Offer
+      description: 'Create a marketplace trade offer.
+
+
+        Body example:
+
+        {"offered_resource": "metal", "offered_amount": 100, "requested_resource":
+        "crystal", "requested_amount": 50}'
+      operationId: create_trade_offer_trade_offers_post
+      security:
+      - OAuth2PasswordBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              title: Payload
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    get:
+      summary: List Trade Offers
+      description: List marketplace offers. Filter by status ('open', 'accepted',
+        'cancelled') or None for all.
+      operationId: list_trade_offers_trade_offers_get
+      parameters:
+      - name: status
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: open
+          title: Status
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 1000
+          minimum: 1
+          default: 50
+          title: Limit
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+          title: Offset
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /trade/accept/{offer_id}:
+    post:
+      summary: Accept Trade Offer
+      description: Accept an open marketplace offer by ID.
+      operationId: accept_trade_offer_trade_accept__offer_id__post
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: offer_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: Offer Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /player/{user_id}/notifications:
+    get:
+      summary: List Notifications
+      description: 'List notifications for the authenticated user.
+
+
+        Prefers database when enabled; falls back to in-memory notifications otherwise.
+
+        Newest-first ordering when using DB.'
+      operationId: list_notifications_player__user_id__notifications_get
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: user_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: User Id
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 200
+          minimum: 1
+          default: 50
+          title: Limit
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+          title: Offset
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /notifications/{notification_id}:
+    delete:
+      summary: Delete Notification
+      description: 'Delete a notification by ID if it belongs to the authenticated
+        user.
+
+
+        Requires database to be enabled. Returns 404 if not found or DB disabled.'
+      operationId: delete_notification_notifications__notification_id__delete
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: notification_id
+        in: path
+        required: true
+        schema:
+          type: integer
+          title: Notification Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+components:
+  schemas:
+    HTTPValidationError:
+      properties:
+        detail:
+          items:
+            $ref: '#/components/schemas/ValidationError'
+          type: array
+          title: Detail
+      type: object
+      title: HTTPValidationError
+    LoginRequest:
+      properties:
+        username:
+          type: string
+          title: Username
+        password:
+          type: string
+          title: Password
+      type: object
+      required:
+      - username
+      - password
+      title: LoginRequest
+    RegisterRequest:
+      properties:
+        username:
+          type: string
+          title: Username
+        email:
+          type: string
+          title: Email
+        password:
+          type: string
+          title: Password
+      type: object
+      required:
+      - username
+      - email
+      - password
+      title: RegisterRequest
+    TokenResponse:
+      properties:
+        access_token:
+          type: string
+          title: Access Token
+        token_type:
+          type: string
+          title: Token Type
+          default: bearer
+      type: object
+      required:
+      - access_token
+      title: TokenResponse
+    ValidationError:
+      properties:
+        loc:
+          items:
+            anyOf:
+            - type: string
+            - type: integer
+          type: array
+          title: Location
+        msg:
+          type: string
+          title: Message
+        type:
+          type: string
+          title: Error Type
+      type: object
+      required:
+      - loc
+      - msg
+      - type
+      title: ValidationError
+  securitySchemes:
+    OAuth2PasswordBearer:
+      type: oauth2
+      flows:
+        password:
+          scopes: {}
+          tokenUrl: /auth/login

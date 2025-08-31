@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ogame
+      POSTGRES_PASSWORD: ogame
+      POSTGRES_DB: ogame
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  web:
+    build: .
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://ogame:ogame@db:5432/ogame"
+      TICK_RATE: "1.0"
+      CORS_ALLOW_ORIGINS: "*"
+      CORS_ALLOW_METHODS: "*"
+      CORS_ALLOW_HEADERS: "*"
+      REQUIRE_START_CHOICE: true
+    depends_on:
+      - db
+    volumes:
+      - .:/app
+
+volumes:
+  pgdata:

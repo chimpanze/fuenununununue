@@ -1,0 +1,1 @@
+# This file is only a snippet holder for the endpoints added to routes.py in the same session.
