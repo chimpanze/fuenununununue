@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
+from src.core.time_utils import utc_now, ensure_aware_utc
 import esper
 import logging
 
 from src.models import ShipBuildQueue, Fleet
+from src.core.sync import complete_next_ship_build, upsert_fleet
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ class ShipyardSystem(esper.Processor):
     """
 
     def process(self) -> None:
-        current_time = datetime.now()
+        current_time = utc_now()
 
         world_obj = getattr(self, "world", None)
         getter = getattr(world_obj, "get_components", esper.get_components)
@@ -32,11 +33,12 @@ class ShipyardSystem(esper.Processor):
                 continue
 
             current_build = ship_queue.items[0]
-            completion_time = current_build.get("completion_time")
+            completion_time = ensure_aware_utc(current_build.get("completion_time"))
             if not completion_time:
                 # Malformed item; drop it to avoid blocking the queue
                 ship_queue.items.pop(0)
                 continue
+            current_build["completion_time"] = completion_time
 
             if current_time >= completion_time:
                 ship_type = current_build.get("type")
@@ -53,6 +55,18 @@ class ShipyardSystem(esper.Processor):
                 # Remove completed item from queue
                 ship_queue.items.pop(0)
 
+                # Persist completion to DB best-effort
+                try:
+                    complete_next_ship_build(self.world, ent)
+                except Exception:
+                    pass
+
+                # Persist updated fleet counts best-effort
+                try:
+                    upsert_fleet(self.world, ent)
+                except Exception:
+                    pass
+
                 try:
                     logger.info(
                         "ship_build_complete",
@@ -61,7 +75,7 @@ class ShipyardSystem(esper.Processor):
                             "entity": ent,
                             "ship_type": ship_type,
                             "count": count,
-                            "timestamp": datetime.now().isoformat(),
+                            "timestamp": utc_now().isoformat(),
                         },
                     )
                 except Exception:

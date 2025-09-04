@@ -59,25 +59,28 @@ def send_to_user(user_id: int, message: Dict[str, Any]) -> None:
     Safe to call from any thread. If the event loop is not available yet,
     the message is dropped silently (best-effort semantics).
     """
-    if _loop is None:
+    loop = _loop
+    if loop is None:
+        return
+    if getattr(loop, "is_closed", None) and loop.is_closed():
         return
     try:
-        # Schedule task creation on the target loop thread to avoid creating
-        # coroutine objects in this thread (which could lead to 'never awaited'
-        # warnings if scheduling fails).
         uid = int(user_id)
         payload = dict(message)
-
-        def _schedule() -> None:
+        fut = asyncio.run_coroutine_threadsafe(_send_to_user_async(uid, payload), loop)
+        # Add a done callback to swallow/log exceptions from the coroutine
+        def _done_cb(f):
             try:
-                asyncio.create_task(_send_to_user_async(uid, payload))
+                _ = f.result()
             except Exception:
                 try:
-                    logger.exception("ws_create_task_failed user_id=%s", uid)
+                    logger.exception("ws_send_task_failed user_id=%s", uid)
                 except Exception:
                     pass
-
-        _loop.call_soon_threadsafe(_schedule)
+        try:
+            fut.add_done_callback(_done_cb)
+        except Exception:
+            pass
     except Exception:
         # Do not propagate errors to producers
         try:

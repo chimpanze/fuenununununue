@@ -12,10 +12,27 @@ from typing import List, Optional
 # Tick rate for the background game loop (ticks per second)
 TICK_RATE: float = float(os.environ.get("TICK_RATE", "1.0"))
 
+# Periodic persistence interval in seconds for saving player data
+# Optional fast-intervals toggle for dev/test without changing production defaults.
+_DEV_FAST = os.environ.get("DEV_FAST_INTERVALS", "false").lower() == "true"
+_DEFAULT_SAVE = "5" if _DEV_FAST else "60"
+SAVE_INTERVAL_SECONDS: int = int(os.environ.get("SAVE_INTERVAL_SECONDS", _DEFAULT_SAVE))
+
+# Per-planet persistence throttling interval (to limit write frequency per planet)
+# Used by src.core.sync to throttle resource and building persistence; keep aligned with SAVE_INTERVAL_SECONDS by default.
+PERSIST_INTERVAL_SECONDS: int = int(os.environ.get("PERSIST_INTERVAL_SECONDS", str(SAVE_INTERVAL_SECONDS)))
+
+# Cleanup configuration: threshold for inactive players (days)
+CLEANUP_DAYS: int = int(os.environ.get("CLEANUP_DAYS", "30"))
+
 # Database configuration
-# Use async driver by default for SQLAlchemy 2.0 AsyncIO (aiosqlite for dev)
-# Example for Postgres: postgresql+asyncpg://user:pass@localhost:5432/dbname
-DATABASE_URL: str = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./dev.db")
+# Global feature toggle for DB integration (tests/dev can disable)
+ENABLE_DB: bool = os.environ.get("ENABLE_DB", "false").lower() == "true"
+# In dev, optionally create all tables at startup without Alembic
+DEV_CREATE_ALL: bool = os.environ.get("DEV_CREATE_ALL", "false").lower() == "true"
+# Use PostgreSQL (asyncpg) by default for SQLAlchemy AsyncIO
+# Example: postgresql+asyncpg://user:pass@localhost:5432/dbname
+DATABASE_URL: str = os.environ.get("DATABASE_URL", "postgresql+asyncpg://ogame:ogame@localhost:5432/ogame")
 # Optional read replicas: comma-separated URLs, e.g., "postgresql+asyncpg://ro1,..."
 # If empty, reads fall back to primary automatically.
 READ_REPLICA_URLS: List[str] = [u.strip() for u in os.environ.get("READ_REPLICA_URLS", "").split(",") if u.strip()]
@@ -174,9 +191,10 @@ MAX_PLAYERS: int = int(os.environ.get("MAX_PLAYERS", "512"))
 # Default: 2x MAX_PLAYERS (can be tuned via env)
 INITIAL_PLANETS: int = int(os.environ.get("INITIAL_PLANETS", str(MAX_PLAYERS * 2)))
 
+
 # Starter flow configuration
 # If True, registration will NOT auto-create a homeworld; users must choose start via endpoint
-REQUIRE_START_CHOICE: bool = os.environ.get("REQUIRE_START_CHOICE", "true").lower() == "true"
+REQUIRE_START_CHOICE: bool = os.environ.get("REQUIRE_START_CHOICE", "false").lower() == "true"
 # Default starter planet name
 STARTER_PLANET_NAME: str = os.environ.get("STARTER_PLANET_NAME", "Homeworld")
 # Default starter resources (applied on initial planet creation when DB path is used)
@@ -190,3 +208,22 @@ PLANET_SIZE_MIN: int = int(os.environ.get('PLANET_SIZE_MIN', '140'))
 PLANET_SIZE_MAX: int = int(os.environ.get('PLANET_SIZE_MAX', '200'))
 PLANET_TEMPERATURE_MIN: int = int(os.environ.get('PLANET_TEMPERATURE_MIN', '-40'))
 PLANET_TEMPERATURE_MAX: int = int(os.environ.get('PLANET_TEMPERATURE_MAX', '60'))
+
+
+# --- Typed getters (single source of truth) ---
+from typing import cast
+
+def get_enable_db() -> bool:
+    return bool(ENABLE_DB)
+
+def get_dev_create_all() -> bool:
+    return bool(DEV_CREATE_ALL)
+
+def get_tick_rate() -> float:
+    return float(TICK_RATE)
+
+def get_save_interval_seconds() -> int:
+    return int(SAVE_INTERVAL_SECONDS)
+
+def get_persist_interval_seconds() -> int:
+    return int(PERSIST_INTERVAL_SECONDS)

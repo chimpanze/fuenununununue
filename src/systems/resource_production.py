@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+from src.core.time_utils import utc_now, ensure_aware_utc, isoformat_utc
 import esper
 
 from src.models import Resources, ResourceProduction, Buildings, Research, Player
-from src.core.sync import sync_planet_resources
 from src.core.config import ENERGY_SOLAR_BASE, ENERGY_CONSUMPTION, PLASMA_PRODUCTION_BONUS, ENERGY_TECH_ENERGY_BONUS_PER_LEVEL
 from src.api.ws import send_to_user
 
@@ -14,15 +14,16 @@ class ResourceProductionSystem(esper.Processor):
 
     def process(self) -> None:
         """Run one tick of the resource production system."""
-        current_time = datetime.now()
+        current_time = utc_now()
 
         world_obj = getattr(self, "world", None)
         getter = getattr(world_obj, "get_components", esper.get_components)
         for ent, (resources, production, buildings) in getter(
             Resources, ResourceProduction, Buildings
         ):
-            # Calculate time difference in hours
-            time_diff = (current_time - production.last_update).total_seconds() / 3600.0
+            # Calculate time difference in hours (normalize to aware UTC)
+            last_update_utc = ensure_aware_utc(production.last_update)
+            time_diff = (current_time - last_update_utc).total_seconds() / 3600.0
 
             if time_diff > 0:
                 # Attempt to fetch research; optional for production effects
@@ -80,9 +81,5 @@ class ResourceProductionSystem(esper.Processor):
                 # Update last update time
                 production.last_update = current_time
 
-                # Persist to database (best-effort, non-blocking)
-                try:
-                    sync_planet_resources(self.world, ent)
-                except Exception:
-                    # Swallow any sync errors to keep the loop stable
-                    pass
+                # Persistence is centralized in GameWorld.save_player_data (periodic ~60s)
+                # Throttling remains enforced in sync._should_persist as a safety net.

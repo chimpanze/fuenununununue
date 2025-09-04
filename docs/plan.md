@@ -15,7 +15,7 @@ This plan synthesizes the key goals and constraints from docs/requirements.md (S
   - FastAPI HTTP server + background game loop thread (~1 Hz) driving ECS (esper).
   - Modular src/ layout; src.main:app is the entry point for ASGI servers.
 - Data & Persistence
-  - Target PostgreSQL via SQLAlchemy (async) and Alembic migrations; Redis for caching.
+  - PostgreSQL only via SQLAlchemy (async) and Alembic migrations. No file-based or SQLite persistence; DB is the single source of truth. Caching layers like Redis are not used for persistence in the current phase.
   - ECS components must sync with database models; design for consistency and atomicity.
 - Security
   - JWT auth, rate limiting, input validation, CORS policy, and secure headers.
@@ -66,6 +66,13 @@ This plan synthesizes the key goals and constraints from docs/requirements.md (S
   - Step 3: Introduce src/core/config.py and src/core/database.py; src.main imports them, preserving API compatibility.
   - Rationale: Small, reversible steps reduce risk and simplify review/testing.
 
+- Upcoming Refactor Plan (facade and world split)
+  - Create src/api/main.py as a thin facade re-exporting FastAPI app, keeping src.main:app for backward compatibility.
+  - Extract GameWorld class into src/core/world.py, leaving src/core/game.py as orchestration and compatibility layer importing from world.py.
+  - Introduce a small persistence scheduler module (e.g., src/core/persist_scheduler.py) that centralizes periodic save triggers and batching decisions; replace ad-hoc calls in the loop over time.
+  - Keep systems in src/systems/ pure (no DB) and route all DB access via src/core/sync.py and the scheduler.
+  - Document the changes and migration steps in README and developer guide; provide deprecation notes if any public import paths change.
+
 
 ## 4) Game Loop, Concurrency, and Reliability
 
@@ -94,7 +101,9 @@ This plan synthesizes the key goals and constraints from docs/requirements.md (S
   - Notification(id, user_id→User, type, payload JSON, priority, created_at, read_at)
 - ECS <-> DB Sync Strategy
   - On login/load: hydrate ECS world for the user from DB.
-  - Periodic persistence: save player changes every N seconds; transactional updates for build completion and resource deductions.
+  - On restart autoload: immediately accrue resources based on elapsed time since ResourceProduction.last_update before the first tick to reflect downtime.
+  - Periodic persistence: centralized in GameWorld.save_player_data, invoked from the game loop every ~60s (configurable). Systems do not directly call sync functions per tick.
+  - Throttling: sync._should_persist still enforces a per-planet minimum interval as a safety net; duplicate triggers were removed.
   - Use versioning/updated_at to detect conflicts; prefer loop‑owned mutations.
 - Migrations
   - Alembic baseline, then incremental scripts as models evolve.
@@ -160,7 +169,7 @@ This plan synthesizes the key goals and constraints from docs/requirements.md (S
 - Concurrency/Loop Tests
   - Multi‑request scenarios; ensure thread safety and correct ordering.
 - Fixtures & Config
-  - Test GameWorld factory; monkeypatch loop to deterministic mode; in‑memory SQLite for DB tests.
+  - Test GameWorld factory; monkeypatch loop to deterministic mode; Postgres test database (docker-compose service or ephemeral).
 - CI
   - GitHub Actions to run lint/test; cache deps; coverage reporting.
 - Rationale: Prevent regressions and allow safe refactors.

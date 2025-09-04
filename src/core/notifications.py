@@ -27,11 +27,18 @@ try:
     from sqlalchemy.exc import SQLAlchemyError  # type: ignore
     from src.core.database import SessionLocal, is_db_enabled  # type: ignore
     from src.models.database import Notification as ORMNotification  # type: ignore
-    _DB_AVAILABLE = is_db_enabled()
 except Exception:  # pragma: no cover
-    _DB_AVAILABLE = False
     SessionLocal = None  # type: ignore
     ORMNotification = None  # type: ignore
+
+
+def _db_available() -> bool:
+    """Dynamic DB availability check aligned with src.core.sync._db_available()."""
+    try:
+        from src.core.database import is_db_enabled as _is
+        return bool(_is())
+    except Exception:
+        return False
 
 # In-memory store: ring buffer per user
 _MAX_PER_USER = 100
@@ -39,7 +46,7 @@ _inmem: Dict[int, List[Dict[str, Any]]] = {}
 
 
 async def _insert_notification_async(user_id: int, ntype: str, payload: Dict[str, Any], priority: str, created_at: datetime) -> None:
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return
     try:
         async with SessionLocal() as session:  # type: ignore[misc]
@@ -95,7 +102,7 @@ def create_notification(user_id: int, ntype: str, payload: Optional[Dict[str, An
         pass
 
     # Best-effort DB persistence
-    if _DB_AVAILABLE:
+    if _db_available():
         try:
             try:
                 loop = asyncio.get_running_loop()

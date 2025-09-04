@@ -8,6 +8,7 @@ from typing import Dict, Optional
 import logging
 import esper
 from dataclasses import fields
+from src.core.time_utils import utc_now, ensure_aware_utc, parse_utc
 
 from src.core.sync import (
     sync_planet_resources,
@@ -16,6 +17,13 @@ from src.core.sync import (
     load_player_into_world,
     load_all_players_into_world,
     cleanup_inactive_players,
+    enqueue_ship_build,
+    load_ship_queue_items,
+    finalize_overdue_ship_builds,
+    enqueue_build_queue,
+    load_build_queue_items,
+    enqueue_research,
+    load_research_queue_items,
 )
 
 from src.models import (
@@ -43,6 +51,19 @@ from src.systems import (
 
 logger = logging.getLogger(__name__)
 from src.core.metrics import metrics
+from src.core.commands import (
+    parse_build_building,
+    parse_demolish_building,
+    parse_cancel_build_queue,
+    parse_update_activity,
+    parse_start_research,
+    parse_build_ships,
+    parse_colonize,
+    parse_fleet_dispatch,
+    parse_fleet_recall,
+    parse_trade_create_offer,
+    parse_trade_accept_offer,
+)
 
 
 class GameWorld:
@@ -53,9 +74,14 @@ class GameWorld:
         self.game_thread: Optional[threading.Thread] = None
         self.command_queue: Queue = Queue()
 
+        # Lifecycle flags
+        self.loaded: bool = False
+
         # Persistence cadence trackers
         self._last_save_ts: float = 0.0
         self._last_cleanup_day: Optional[int] = None
+        # Lightweight lock to prevent overlapping saves
+        self._save_lock: threading.Lock = threading.Lock()
 
         # Register systems
         self.world.add_processor(ResourceProductionSystem())
@@ -85,13 +111,25 @@ class GameWorld:
         setattr(self.world, "handle_battle_report", self.handle_battle_report)
         setattr(self.world, "handle_espionage_report", self.handle_espionage_report)
 
+        # Removed file-backed hydration for market offers and reports.
+        # Open offers will be hydrated from the database in load_player_data when DB is enabled.
+        # In-memory stores remain empty by default when DB is disabled.
+
         # No default test data; players are created via registration or tests
         # Initialize galaxy (config-driven; idempotent)
         try:
             from src.systems.planet_creation import initialize_galaxy
             initialize_galaxy()
         except Exception:
-            pass
+            logger.warning(
+                "Failed to initialize galaxy",
+                extra={
+                    "user_id": None,
+                    "entity_id": None,
+                    "action_context": "startup:initialize_galaxy",
+                },
+                exc_info=True,
+            )
 
 
     def start_game_loop(self) -> None:
@@ -108,14 +146,34 @@ class GameWorld:
         if self.game_thread:
             self.game_thread.join()
             logger.info("Game loop stopped")
+        # Final save best-effort on shutdown
+        try:
+            self.save_player_data()
+        except Exception:
+            logger.warning(
+                "Final save on stop failed",
+                extra={
+                    "user_id": None,
+                    "entity_id": None,
+                    "action_context": "shutdown:final_save",
+                },
+                exc_info=True,
+            )
 
     def _game_loop(self) -> None:
-        """Main game loop - processes all systems every tick."""
+        """Main game loop - processes all systems every tick.
+
+        Uses time.monotonic() for scheduling to avoid wall-clock adjustments
+        impacting cadence. Records tick duration and start-time jitter.
+        """
         from src.core.config import TICK_RATE
 
-        tick_rate = TICK_RATE  # ticks per second
+        period_s = TICK_RATE  # treated as seconds per tick (default 1.0)
+        next_tick = time.monotonic()
         while self.running:
-            start_time = time.time()
+            planned_start = next_tick
+            actual_start = time.monotonic()
+            jitter_s = actual_start - planned_start
 
             # Process queued commands
             self._process_commands()
@@ -123,33 +181,109 @@ class GameWorld:
             # Process all ECS systems
             self.world.process()
 
-            # Periodic persistence (every ~60s)
+            # Periodic persistence (every ~60s, wall-clock based)
             try:
                 import time as _t
-                if _t.time() - self._last_save_ts >= 60.0:
+                from src.core.config import SAVE_INTERVAL_SECONDS
+                if _t.time() - self._last_save_ts >= float(SAVE_INTERVAL_SECONDS):
                     self.save_player_data()
-                    self._last_save_ts = _t.time()
             except Exception:
-                pass
+                logger.warning(
+                    "Periodic save failed",
+                    extra={
+                        "user_id": None,
+                        "entity_id": None,
+                        "action_context": "loop:periodic_save",
+                    },
+                    exc_info=True,
+                )
 
             # Daily cleanup job (once per day)
             try:
                 from datetime import datetime as _dt, timezone as _tz
+                from src.core.config import CLEANUP_DAYS
                 day = _dt.now(_tz.utc).timetuple().tm_yday
                 if self._last_cleanup_day != day:
-                    cleanup_inactive_players(days=30)
+                    cleanup_inactive_players(days=int(CLEANUP_DAYS))
                     self._last_cleanup_day = day
             except Exception:
-                pass
+                logger.warning(
+                    "Daily cleanup job failed",
+                    extra={
+                        "user_id": None,
+                        "entity_id": None,
+                        "action_context": "loop:daily_cleanup",
+                    },
+                    exc_info=True,
+                )
 
-            # Maintain tick rate
-            elapsed = time.time() - start_time
+            # Maintain tick cadence using monotonic clock
+            end_time = time.monotonic()
+            elapsed = end_time - actual_start
             try:
-                metrics.record_tick(elapsed)
+                metrics.record_tick(elapsed, jitter_s=jitter_s)
+                try:
+                    logger.debug(
+                        "tick_complete",
+                        extra={
+                            "duration_ms": elapsed * 1000.0,
+                            "jitter_ms": abs(jitter_s) * 1000.0,
+                        },
+                    )
+                except Exception:
+                    pass
+            except Exception:
+                logger.warning(
+                    "Recording tick metrics failed",
+                    extra={
+                        "user_id": None,
+                        "entity_id": None,
+                        "action_context": "loop:metrics_record_tick",
+                    },
+                    exc_info=True,
+                )
+
+            next_tick = planned_start + period_s
+            sleep_time = max(0.0, next_tick - time.monotonic())
+            time.sleep(sleep_time)
+
+    def run_cleanup_now(self, days: Optional[int] = None) -> int:
+        """Run the inactive players cleanup immediately.
+
+        This is a test hook to make the daily cleanup job invokable on demand
+        without waiting for the day boundary in the game loop. Returns the
+        number of cleaned-up players (best-effort; 0 on failure).
+        """
+        try:
+            from src.core.config import CLEANUP_DAYS as _CLEANUP_DAYS
+            d = int(days) if days is not None else int(_CLEANUP_DAYS)
+        except Exception:
+            d = 30
+        try:
+            count = cleanup_inactive_players(days=d)
+            try:
+                logger.info(
+                    "cleanup_now",
+                    extra={
+                        "days": d,
+                        "removed_count": count,
+                        "action_context": "manual:cleanup",
+                    },
+                )
             except Exception:
                 pass
-            sleep_time = max(0, tick_rate - elapsed)
-            time.sleep(sleep_time)
+            return int(count or 0)
+        except Exception:
+            logger.warning(
+                "Manual cleanup failed",
+                extra={
+                    "user_id": None,
+                    "entity_id": None,
+                    "action_context": "manual:cleanup",
+                },
+                exc_info=True,
+            )
+            return 0
 
     def _process_commands(self) -> None:
         """Process commands from the HTTP API."""
@@ -178,55 +312,38 @@ class GameWorld:
             pass
 
         if cmd_type == 'build_building':
-            self._handle_build_building(user_id, command.get('building_type'))
+            uid, building_type = parse_build_building(command)
+            self._handle_build_building(uid, building_type)
         elif cmd_type == 'demolish_building':
-            self._handle_demolish_building(user_id, command.get('building_type'))
+            uid, building_type = parse_demolish_building(command)
+            self._handle_demolish_building(uid, building_type)
         elif cmd_type == 'cancel_build_queue':
-            self._handle_cancel_build_queue(user_id, command.get('index'))
+            uid, index = parse_cancel_build_queue(command)
+            self._handle_cancel_build_queue(uid, index)
         elif cmd_type == 'update_player_activity':
-            self._handle_update_activity(user_id)
+            uid = parse_update_activity(command)
+            self._handle_update_activity(uid)
         elif cmd_type == 'start_research':
-            self._handle_start_research(user_id, command.get('research_type'))
+            uid, research_type = parse_start_research(command)
+            self._handle_start_research(uid, research_type)
         elif cmd_type == 'build_ships':
-            self._handle_build_ships(user_id, command.get('ship_type'), int(command.get('quantity', 1)))
+            uid, ship_type, qty = parse_build_ships(command)
+            self._handle_build_ships(uid, ship_type, qty)
         elif cmd_type == 'colonize':
-            self._handle_colonize(
-                user_id,
-                int(command.get('galaxy', 1) or 1),
-                int(command.get('system', 1) or 1),
-                int(command.get('position', 1) or 1),
-                command.get('planet_name') or "Colony",
-            )
+            uid, galaxy, system, position, planet_name = parse_colonize(command)
+            self._handle_colonize(uid, galaxy, system, position, planet_name)
         elif cmd_type == 'fleet_dispatch':
-            self._handle_fleet_dispatch(
-                user_id,
-                int(command.get('galaxy', 1) or 1),
-                int(command.get('system', 1) or 1),
-                int(command.get('position', 1) or 1),
-                command.get('mission') or 'transfer',
-                command.get('speed'),
-                command.get('ships'),
-            )
+            uid, galaxy, system, position, mission, speed, ships = parse_fleet_dispatch(command)
+            self._handle_fleet_dispatch(uid, galaxy, system, position, mission, speed, ships)
         elif cmd_type == 'fleet_recall':
-            try:
-                fleet_id = int(command.get('fleet_id')) if command.get('fleet_id') is not None else None
-            except Exception:
-                fleet_id = None
-            self._handle_fleet_recall(user_id, fleet_id)
+            uid, fleet_id = parse_fleet_recall(command)
+            self._handle_fleet_recall(uid, fleet_id)
         elif cmd_type == 'trade_create_offer':
-            self._handle_trade_create_offer(
-                user_id,
-                command.get('offered_resource'),
-                int(command.get('offered_amount', 0) or 0),
-                command.get('requested_resource'),
-                int(command.get('requested_amount', 0) or 0),
-            )
+            uid, offered_resource, offered_amount, requested_resource, requested_amount = parse_trade_create_offer(command)
+            self._handle_trade_create_offer(uid, offered_resource, offered_amount, requested_resource, requested_amount)
         elif cmd_type == 'trade_accept_offer':
-            try:
-                offer_id = int(command.get('offer_id'))
-            except Exception:
-                offer_id = -1
-            self._handle_trade_accept_offer(user_id, offer_id)
+            uid, offer_id = parse_trade_accept_offer(command)
+            self._handle_trade_accept_offer(uid, offer_id)
 
     def _handle_demolish_building(self, user_id: int, building_type: str) -> None:
         """Handle building demolition with prerequisite safety and partial refund."""
@@ -370,12 +487,20 @@ class GameWorld:
                     pass
 
                 # Add to build queue
+                # Use naive local datetime for compatibility with tests; systems normalize to UTC when processing
                 completion_time = datetime.now() + timedelta(seconds=build_time)
                 build_queue.items.append({
                     'type': building_type,
                     'completion_time': completion_time,
                     'cost': cost,
                 })
+
+                # Persist to DB queue (best-effort)
+                try:
+                    new_level = int(current_level) + 1
+                    enqueue_build_queue(self.world, ent, building_type, new_level, completion_time)
+                except Exception:
+                    pass
 
                 logger.info(f"Started building {building_type} for user {user_id}")
                 return
@@ -386,7 +511,7 @@ class GameWorld:
         """Update player's last activity time."""
         for ent, (player,) in self.world.get_components(Player):
             if player.user_id == user_id:
-                player.last_active = datetime.now()
+                player.last_active = utc_now()
                 break
 
     def _handle_start_research(self, user_id: int, research_type: str) -> None:
@@ -446,6 +571,12 @@ class GameWorld:
                     'completion_time': completion_time,
                     'cost': cost,
                 })
+                # Persist to DB research queue (best-effort)
+                try:
+                    new_level = int(current_level) + 1
+                    enqueue_research(self.world, ent, research_type, new_level, completion_time)
+                except Exception:
+                    pass
                 logger.info(f"Started research {research_type} for user {user_id}")
                 return
         logger.warning(f"Could not start research {research_type} for user {user_id}")
@@ -592,6 +723,11 @@ class GameWorld:
                     'completion_time': completion_time,
                     'cost': total_cost,
                 })
+                # Persist to DB best-effort when enabled
+                try:
+                    enqueue_ship_build(self.world, ent, ship_type, quantity, completion_time)
+                except Exception:
+                    pass
                 try:
                     logger.info(
                         "ship_build_started",
@@ -648,6 +784,12 @@ class GameWorld:
                     setattr(fleet, 'colony_ship', max(0, cships - 1))
                 except Exception:
                     pass
+                # Persist updated fleet counts best-effort
+                try:
+                    from src.core.sync import upsert_fleet as _upsert_fleet
+                    _upsert_fleet(self.world, ent_match)
+                except Exception:
+                    pass
                 # Optionally log
                 try:
                     logger.info(
@@ -689,7 +831,7 @@ class GameWorld:
             # Build movement component
             try:
                 from src.models import FleetMovement as _FM
-                now = datetime.now()
+                now = utc_now()
                 origin = Position(galaxy=pos.galaxy, system=pos.system, planet=pos.planet)
                 target = Position(galaxy=galaxy, system=system, planet=planet_pos)
                 # Calculate travel time based on distance and effective fleet speed
@@ -792,6 +934,12 @@ class GameWorld:
                 except Exception:
                     # If adding fails, do not crash
                     pass
+                # Persist mission best-effort
+                try:
+                    from src.core.sync import upsert_fleet_mission as _upsert_mission
+                    _upsert_mission(self.world, ent, movement)
+                except Exception:
+                    pass
                 try:
                     logger.info(
                         "fleet_dispatch_queued",
@@ -862,9 +1010,15 @@ class GameWorld:
         except Exception:
             return False
 
-        now = datetime.now()
+        now = utc_now()
         # Find the player's entity that has an active FleetMovement
         for ent, (p, mv) in self.world.get_components(_P, _FM):
+            # Normalize existing movement timestamps to aware UTC during recall handling
+            try:
+                mv.arrival_time = ensure_aware_utc(getattr(mv, 'arrival_time', None))
+                mv.departure_time = ensure_aware_utc(getattr(mv, 'departure_time', None))
+            except Exception:
+                pass
             try:
                 if int(p.user_id) != int(user_id):
                     continue
@@ -902,6 +1056,12 @@ class GameWorld:
             except Exception:
                 return False
 
+            # Persist mission update best-effort
+            try:
+                from src.core.sync import upsert_fleet_mission as _upsert_mission
+                _upsert_mission(self.world, ent, mv)
+            except Exception:
+                pass
             # Log
             try:
                 logger.info(
@@ -1084,20 +1244,40 @@ class GameWorld:
     # Battle Reports API (in-memory)
     # -----------------
     def handle_battle_report(self, report: dict) -> None:
-        """Append a battle report to the in-memory store with id and timestamp.
+        """Store a battle report. Uses DB when enabled; otherwise in-memory.
 
         The report should include attacker_user_id and defender_user_id keys.
         """
-        try:
-            rid = int(self._next_battle_report_id)
-            self._next_battle_report_id += 1
-        except Exception:
-            rid = 1
-            self._next_battle_report_id = 2
         payload = dict(report or {})
-        payload["id"] = rid
-        payload["created_at"] = datetime.now().isoformat()
-        self._battle_reports.append(payload)
+        rid = None
+        created_iso = None
+        used_db = False
+        # Try DB-backed storage first via sync helper
+        try:
+            from src.core.sync import create_battle_report as _create_br
+            res = _create_br(payload)
+            if res:
+                rid, created_iso = res
+                used_db = True
+        except Exception:
+            used_db = False
+
+        if not used_db:
+            # In-memory fallback
+            try:
+                rid = int(self._next_battle_report_id)
+                self._next_battle_report_id += 1
+            except Exception:
+                rid = 1
+                self._next_battle_report_id = 2
+            payload["id"] = rid
+            payload["created_at"] = datetime.now().isoformat()
+            self._battle_reports.append(payload)
+        else:
+            payload["id"] = rid
+            payload["created_at"] = created_iso
+
+        # Log and notify (best-effort)
         try:
             logger.info(
                 "battle_report_stored",
@@ -1111,7 +1291,6 @@ class GameWorld:
             )
         except Exception:
             pass
-        # Emit real-time notifications to participants (best-effort)
         try:
             from src.api.ws import send_to_user as _ws_send
             attacker_id = payload.get("attacker_user_id")
@@ -1127,7 +1306,6 @@ class GameWorld:
                 _ws_send(int(attacker_id), event)
             if defender_id:
                 _ws_send(int(defender_id), event)
-            # Persist offline battle outcome notifications with critical priority (best-effort)
             try:
                 from src.core.notifications import create_notification as _notify
                 if attacker_id:
@@ -1148,7 +1326,9 @@ class GameWorld:
             pass
 
     def list_battle_reports(self, user_id: int, limit: int = 50, offset: int = 0) -> list[dict]:
-        """Return battle reports visible to a user (attacker or defender)."""
+        """Return battle reports visible to a user (attacker or defender).
+        When DB is enabled, callers should prefer API route's DB path; this is an in-memory fallback.
+        """
         try:
             uid = int(user_id)
         except Exception:
@@ -1156,7 +1336,6 @@ class GameWorld:
         reports = [r for r in reversed(self._battle_reports) if r.get("attacker_user_id") == uid or r.get("defender_user_id") == uid]
         start = max(0, int(offset))
         end = max(start, start + int(limit))
-        # Return shallow copies to avoid accidental external mutation
         return [dict(r) for r in reports[start:end]]
 
     def get_battle_report(self, user_id: int, report_id: int) -> dict | None:
@@ -1175,21 +1354,39 @@ class GameWorld:
     # Espionage Reports API (in-memory)
     # -----------------
     def handle_espionage_report(self, report: dict) -> None:
-        """Append an espionage report to the in-memory store with id and timestamp.
+        """Store an espionage report. Uses DB when enabled; otherwise in-memory.
 
         The report should include attacker_user_id, defender_user_id (optional if unoccupied),
         location {galaxy, system, planet}, and a snapshot payload.
         """
-        try:
-            rid = int(self._next_espionage_report_id)
-            self._next_espionage_report_id += 1
-        except Exception:
-            rid = 1
-            self._next_espionage_report_id = 2
         payload = dict(report or {})
-        payload["id"] = rid
-        payload["created_at"] = datetime.now().isoformat()
-        self._espionage_reports.append(payload)
+        rid = None
+        created_iso = None
+        used_db = False
+        # Try DB-backed storage first via sync helper
+        try:
+            from src.core.sync import create_espionage_report as _create_er
+            res = _create_er(payload)
+            if res:
+                rid, created_iso = res
+                used_db = True
+        except Exception:
+            used_db = False
+
+        if not used_db:
+            try:
+                rid = int(self._next_espionage_report_id)
+                self._next_espionage_report_id += 1
+            except Exception:
+                rid = 1
+                self._next_espionage_report_id = 2
+            payload["id"] = rid
+            payload["created_at"] = datetime.now().isoformat()
+            self._espionage_reports.append(payload)
+        else:
+            payload["id"] = rid
+            payload["created_at"] = created_iso
+
         try:
             logger.info(
                 "espionage_report_stored",
@@ -1234,7 +1431,16 @@ class GameWorld:
         """Persist ECS state to database best-effort for each player entity.
 
         Uses sync helpers which already throttle resource writes to once per 60s.
+        Protected by a lightweight lock to prevent overlapping runs.
         """
+        import time as _t
+        if not hasattr(self, "_save_lock"):
+            # Fallback for legacy instances
+            self._save_lock = threading.Lock()
+        if not self._save_lock.acquire(blocking=False):
+            # Skip if a save is already in progress
+            return
+        _start = _t.perf_counter()
         try:
             for ent, (player, position) in self.world.get_components(Player, Position):
                 # Persist resources and production (throttled inside sync)
@@ -1255,17 +1461,308 @@ class GameWorld:
         except Exception:
             # do not fail the loop
             pass
+        finally:
+            try:
+                self._save_lock.release()
+            except Exception:
+                pass
+            try:
+                duration_s = _t.perf_counter() - _start
+                from src.core.metrics import metrics as _metrics
+                _metrics.increment_event("save.count", 1)
+                _metrics.record_timer("save.duration_s", duration_s)
+                self._last_save_ts = _t.time()
+                try:
+                    logger.info(
+                        "save_complete",
+                        extra={
+                            "action_type": "save",
+                            "duration_ms": duration_s * 1000.0,
+                        },
+                    )
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    def _apply_offline_resource_accrual(self) -> None:
+        """Apply immediate resource accrual for all loaded entities based on elapsed time.
+
+        Mirrors ResourceProductionSystem.process but runs once on autoload to ensure
+        resources reflect time since last_update before the first tick.
+        """
+        try:
+            now = utc_now()
+            from src.models import Resources as _Res, ResourceProduction as _Prod, Buildings as _Bld, Research as _Resh
+            # Import config constants locally to avoid widening module imports
+            from src.core.config import (
+                ENERGY_SOLAR_BASE as _ENERGY_SOLAR_BASE,
+                ENERGY_CONSUMPTION as _ENERGY_CONSUMPTION,
+                PLASMA_PRODUCTION_BONUS as _PLASMA_BONUS,
+                ENERGY_TECH_ENERGY_BONUS_PER_LEVEL as _ENERGY_BONUS_PER_LVL,
+            )
+            getter = getattr(self.world, "get_components", esper.get_components)
+            for ent, (resources, production, buildings) in getter(_Res, _Prod, _Bld):
+                try:
+                    last_update_utc = ensure_aware_utc(production.last_update)
+                    hours = (now - last_update_utc).total_seconds() / 3600.0
+                    if hours <= 0:
+                        continue
+                    # Optional research bonuses
+                    plasma_lvl = 0
+                    energy_lvl = 0
+                    try:
+                        research = self.world.component_for_entity(ent, _Resh)
+                        plasma_lvl = int(getattr(research, 'plasma', 0))
+                        energy_lvl = int(getattr(research, 'energy', 0))
+                    except Exception:
+                        pass
+                    # Energy balance factor
+                    energy_bonus_factor = 1.0 + (_ENERGY_BONUS_PER_LVL * energy_lvl)
+                    energy_produced = _ENERGY_SOLAR_BASE * max(0, getattr(buildings, 'solar_plant', 0)) * energy_bonus_factor
+                    energy_required = 0.0
+                    energy_required += _ENERGY_CONSUMPTION.get('metal_mine', 0.0) * max(0, getattr(buildings, 'metal_mine', 0))
+                    energy_required += _ENERGY_CONSUMPTION.get('crystal_mine', 0.0) * max(0, getattr(buildings, 'crystal_mine', 0))
+                    energy_required += _ENERGY_CONSUMPTION.get('deuterium_synthesizer', 0.0) * max(0, getattr(buildings, 'deuterium_synthesizer', 0))
+                    factor = 1.0 if energy_required <= 0 else min(1.0, energy_produced / energy_required)
+                    # Base production with building multipliers
+                    metal_prod = production.metal_rate * (1.1 ** max(0, getattr(buildings, 'metal_mine', 0))) * hours * factor
+                    crystal_prod = production.crystal_rate * (1.1 ** max(0, getattr(buildings, 'crystal_mine', 0))) * hours * factor
+                    deuterium_prod = production.deuterium_rate * (1.1 ** max(0, getattr(buildings, 'deuterium_synthesizer', 0))) * hours * factor
+                    if plasma_lvl > 0:
+                        metal_prod *= (1.0 + _PLASMA_BONUS.get('metal', 0.0) * plasma_lvl)
+                        crystal_prod *= (1.0 + _PLASMA_BONUS.get('crystal', 0.0) * plasma_lvl)
+                        deuterium_prod *= (1.0 + _PLASMA_BONUS.get('deuterium', 0.0) * plasma_lvl)
+                    d_metal = int(round(metal_prod))
+                    d_crystal = int(round(crystal_prod))
+                    d_deut = int(round(deuterium_prod))
+                    if d_metal or d_crystal or d_deut:
+                        resources.metal += d_metal
+                        resources.crystal += d_crystal
+                        resources.deuterium += d_deut
+                    # Reset last_update to now to avoid double-accrual on first tick
+                    production.last_update = now
+                except Exception:
+                    # Continue with next entity on any error to avoid breaking startup
+                    continue
+        except Exception:
+            # Top-level guard; this helper is best-effort
+            pass
 
     def load_player_data(self, user_id: Optional[int] = None) -> None:
         """Load player(s) from DB into ECS world.
 
         If user_id is provided, loads that user; otherwise loads all users.
+        Also hydrates in-memory ID counters from DB maxima when DB is enabled to prevent collisions.
         """
         try:
             if user_id is None:
                 load_all_players_into_world(self.world)
             else:
                 load_player_into_world(self.world, user_id)
+        except Exception:
+            pass
+        # Best-effort hydrate in-memory ID counters when DB is enabled
+        try:
+            from src.core.database import is_db_enabled as _is_db_enabled, SessionLocal as _SessionLocal
+            if _is_db_enabled() and _SessionLocal is not None and user_id is None:
+                import asyncio
+                async def _hydrate_ids_and_set():
+                    from sqlalchemy import select, func
+                    from src.models.database import TradeOffer as _TO, TradeEvent as _TE, BattleReport as _BR, EspionageReport as _ER
+                    async with _SessionLocal() as session:
+                        # Reconcile next IDs from DB maxima
+                        max_offer = (await session.execute(select(func.max(_TO.id)))).scalar() or 0
+                        max_event = (await session.execute(select(func.max(_TE.id)))).scalar() or 0
+                        max_battle = (await session.execute(select(func.max(_BR.id)))).scalar() or 0
+                        max_esp = (await session.execute(select(func.max(_ER.id)))).scalar() or 0
+                        try:
+                            if max_offer:
+                                self._next_offer_id = int(max_offer) + 1
+                            if max_event:
+                                self._next_trade_event_id = int(max_event) + 1
+                            if max_battle:
+                                self._next_battle_report_id = int(max_battle) + 1
+                            if max_esp:
+                                self._next_espionage_report_id = int(max_esp) + 1
+                        except Exception:
+                            pass
+                        # Hydrate open market offers into in-memory ECS for gameplay operations (acceptance/escrow)
+                        try:
+                            # Load open offers newest first and merge without duplication
+                            result = await session.execute(
+                                select(_TO).where(_TO.status == 'open').order_by(_TO.created_at.desc())
+                            )
+                            rows = result.scalars().all()
+                            existing_ids = {int(o.get('id')) for o in self._market_offers if 'id' in o}
+                            for o in rows:
+                                oid = int(getattr(o, 'id'))
+                                if oid in existing_ids:
+                                    continue
+                                self._market_offers.append({
+                                    'id': oid,
+                                    'seller_user_id': int(getattr(o, 'seller_user_id')),
+                                    'offered_resource': getattr(o, 'offered_resource'),
+                                    'offered_amount': int(getattr(o, 'offered_amount')),
+                                    'requested_resource': getattr(o, 'requested_resource'),
+                                    'requested_amount': int(getattr(o, 'requested_amount')),
+                                    'status': getattr(o, 'status'),
+                                    'accepted_by': int(getattr(o, 'accepted_by')) if getattr(o, 'accepted_by') is not None else None,
+                                    'created_at': getattr(o, 'created_at').isoformat() if getattr(o, 'created_at', None) else None,
+                                    'accepted_at': getattr(o, 'accepted_at').isoformat() if getattr(o, 'accepted_at', None) else None,
+                                })
+                        except Exception:
+                            # Best-effort hydration; continue on error
+                            pass
+                try:
+                    import asyncio as _asyncio
+                    try:
+                        # If a loop is running (e.g., FastAPI lifespan), schedule the task
+                        loop = _asyncio.get_running_loop()
+                        loop.create_task(_hydrate_ids_and_set())
+                    except RuntimeError:
+                        # No running loop: safe to run synchronously
+                        _asyncio.run(_hydrate_ids_and_set())
+                except Exception:
+                    # Best-effort; ignore any hydration errors
+                    pass
+        except Exception:
+            pass
+        # Hydrate ship build queue from DB when enabled; finalize overdue items immediately
+        try:
+            from src.core.database import is_db_enabled as _is_db_enabled
+            if _is_db_enabled():
+                for ent, (player, sbq, fleet) in self.world.get_components(Player, ShipBuildQueue, Fleet):
+                    try:
+                        items = load_ship_queue_items(self.world, ent) or []
+                    except Exception:
+                        items = []
+                    if items and not getattr(sbq, 'items', None):
+                        sbq.items = list(items)
+                    # Finalize overdue items: apply to fleet and mark DB rows complete
+                    try:
+                        finalize_overdue_ship_builds(self.world, ent)
+                    except Exception:
+                        pass
+                    # Remove any overdue items from in-memory queue to avoid double-processing
+                    try:
+                        now = utc_now()
+                        while getattr(sbq, 'items', None):
+                            ct = ensure_aware_utc(sbq.items[0].get('completion_time'))
+                            if not ct or now < ct:
+                                break
+                            sbq.items.pop(0)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # File-backed hydration for build/research queues removed (Postgres-only persistence)
+        # Previously: file-backed load of queues; now removed.
+        # Rationale: DB is the single source of truth; ECS will manage runtime queues, and systems
+        # will persist changes via DB-backed helpers when implemented.
+        # No action needed here.
+
+        # Hydrate building and research queues from DB when enabled
+        try:
+            from src.core.database import is_db_enabled as _is_db_enabled
+            if _is_db_enabled():
+                # Building queue per planet
+                from src.models import BuildQueue as _BQ
+                for ent, (player, bq) in self.world.get_components(Player, _BQ):
+                    try:
+                        items = load_build_queue_items(self.world, ent) or []
+                    except Exception:
+                        items = []
+                    if items and not getattr(bq, 'items', None):
+                        bq.items = list(items)
+                # Research queue per user
+                from src.models import ResearchQueue as _RQ
+                for ent, (player, rq) in self.world.get_components(Player, _RQ):
+                    try:
+                        ritems = load_research_queue_items(self.world, ent) or []
+                    except Exception:
+                        ritems = []
+                    if ritems and not getattr(rq, 'items', None):
+                        rq.items = list(ritems)
+        except Exception:
+            pass
+
+        # Hydrate fleet missions from DB and finalize overdue ones immediately
+        try:
+            from src.core.database import is_db_enabled as _is_db_enabled
+            if _is_db_enabled():
+                from datetime import datetime as _dt
+                from src.core.sync import load_fleet_mission as _load_mission, delete_fleet_mission as _delete_mission
+                from src.models import FleetMovement as _FM, Position as _Pos
+                for ent, (player, pos) in self.world.get_components(Player, Position):
+                    # Skip if a movement component already attached (e.g., during same-process restart)
+                    try:
+                        _existing = self.world.component_for_entity(ent, _FM)
+                        if _existing:
+                            continue
+                    except Exception:
+                        pass
+                    data = None
+                    try:
+                        data = _load_mission(self.world, ent)
+                    except Exception:
+                        data = None
+                    if not data:
+                        continue
+                    # Build movement component
+                    try:
+                        origin = _Pos(galaxy=int(data['origin']['galaxy']), system=int(data['origin']['system']), planet=int(data['origin']['planet']))
+                        target = _Pos(galaxy=int(data['target']['galaxy']), system=int(data['target']['system']), planet=int(data['target']['planet']))
+                        dep = data.get('departure_time')
+                        arr = data.get('arrival_time')
+                        # Normalize tz-aware datetimes to naive for consistent comparisons
+                        if hasattr(dep, 'tzinfo') and dep.tzinfo is not None:
+                            dep = dep.replace(tzinfo=None)
+                        if hasattr(arr, 'tzinfo') and arr.tzinfo is not None:
+                            arr = arr.replace(tzinfo=None)
+                        mv = _FM(
+                            origin=origin,
+                            target=target,
+                            departure_time=dep,
+                            arrival_time=arr,
+                            speed=float(data.get('speed') or 1.0),
+                            mission=str(data.get('mission') or 'transfer'),
+                            owner_id=int(getattr(player, 'user_id', 0) or 0),
+                            recalled=bool(data.get('recalled') or False),
+                        )
+                    except Exception:
+                        continue
+                    # If overdue, finalize immediately by applying target position and deleting mission
+                    try:
+                        now = _dt.now()
+                        if now >= mv.arrival_time:
+                            # Apply position to target (for recalled, target is origin already)
+                            try:
+                                pos.galaxy = int(mv.target.galaxy)
+                                pos.system = int(mv.target.system)
+                                pos.planet = int(mv.target.planet)
+                            except Exception:
+                                pass
+                            try:
+                                _delete_mission(self.world, ent)
+                            except Exception:
+                                pass
+                            continue
+                    except Exception:
+                        pass
+                    # Otherwise, attach component so system continues processing
+                    try:
+                        self.world.add_component(ent, mv)
+                    except Exception:
+                        pass
+        except Exception:
+            # Best-effort hydration; safe to ignore errors
+            pass
+
+        # Apply offline resource accrual immediately after hydration/finalization
+        try:
+            self._apply_offline_resource_accrual()
         except Exception:
             pass
 
@@ -1308,7 +1805,7 @@ class GameWorld:
     # Trade History API (in-memory)
     # -----------------
     def _record_trade_event(self, event: dict) -> None:
-        """Record a trade event in memory with id and timestamp and log it.
+        """Record a trade event via the centralized service.
 
         Event shape (keys may be None depending on type):
         - type: 'offer_created' | 'trade_completed'
@@ -1318,44 +1815,23 @@ class GameWorld:
         - offered_resource, offered_amount, requested_resource, requested_amount
         - status: 'open'|'completed'
         """
+        # Preserve previous behavior: if DB is enabled, avoid in-memory duplication
         try:
-            eid = int(self._next_trade_event_id)
-            self._next_trade_event_id += 1
-        except Exception:
-            eid = 1
-            self._next_trade_event_id = 2
-        payload = dict(event or {})
-        payload["id"] = eid
-        if "timestamp" not in payload:
-            payload["timestamp"] = datetime.now().isoformat()
-        self._trade_history.append(payload)
-        try:
-            logger.info(
-                "trade_event",
-                extra={
-                    "action_type": payload.get("type"),
-                    "event_id": eid,
-                    "offer_id": payload.get("offer_id"),
-                    "seller_user_id": payload.get("seller_user_id"),
-                    "buyer_user_id": payload.get("buyer_user_id"),
-                    "timestamp": payload.get("timestamp"),
-                },
-            )
+            from src.core.database import is_db_enabled as _is_db_enabled
+            if _is_db_enabled():
+                return
         except Exception:
             pass
-        # Real-time notification to participants (best-effort)
         try:
-            from src.api.ws import send_to_user as _ws_send
-            seller_id = payload.get("seller_user_id")
-            buyer_id = payload.get("buyer_user_id")
-            event = dict(payload)
-            event["type"] = "trade_event"
-            if seller_id:
-                _ws_send(int(seller_id), event)
-            if buyer_id:
-                _ws_send(int(buyer_id), event)
+            # Delegate to service (handles in-memory and WS emission)
+            from src.core.trade_events import record_trade_event_sync  # lazy import to avoid cycles
+            record_trade_event_sync(event, gw=self)
         except Exception:
-            pass
+            # Preserve previous best-effort behavior
+            try:
+                logger.debug("record_trade_event_service_failed")
+            except Exception:
+                pass
 
     def list_trade_history(self, user_id: int, limit: int = 50, offset: int = 0) -> list[dict]:
         """Return trade events relevant to the given user id, newest-first.

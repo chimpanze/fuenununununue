@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
+from src.core.time_utils import utc_now, ensure_aware_utc
 import logging
 import esper
 
 from src.models import Fleet, Position, FleetMovement
+from src.core.sync import upsert_fleet
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +25,18 @@ class FleetMovementSystem(esper.Processor):
     """
 
     def process(self) -> None:
-        now = datetime.now()
+        now = utc_now()
 
         world_obj = getattr(self, "world", None)
         getter = getattr(world_obj, "get_components", esper.get_components)
 
         for ent, (fleet, movement) in getter(Fleet, FleetMovement):
+            # Normalize potentially naive timestamps to aware UTC
+            try:
+                movement.arrival_time = ensure_aware_utc(getattr(movement, "arrival_time", None))
+                movement.departure_time = ensure_aware_utc(getattr(movement, "departure_time", None))
+            except Exception:
+                pass
             mission = str(getattr(movement, "mission", "")).lower()
 
             # If not yet arrived to current phase ETA, skip
@@ -50,6 +57,12 @@ class FleetMovementSystem(esper.Processor):
                         # Abort mission if no colony ship available
                         try:
                             self.world.remove_component(ent, FleetMovement)
+                        except Exception:
+                            pass
+                        # Delete persisted mission best-effort
+                        try:
+                            from src.core.sync import delete_fleet_mission as _del_mission
+                            _del_mission(self.world, ent)
                         except Exception:
                             pass
                         try:
@@ -100,8 +113,19 @@ class FleetMovementSystem(esper.Processor):
                                     setattr(fleet, "colony_ship", max(0, c - 1))
                                 except Exception:
                                     pass
+                                # Persist updated fleet counts best-effort
+                                try:
+                                    upsert_fleet(self.world, ent)
+                                except Exception:
+                                    pass
                             try:
                                 self.world.remove_component(ent, FleetMovement)
+                            except Exception:
+                                pass
+                            # Delete persisted mission best-effort
+                            try:
+                                from src.core.sync import delete_fleet_mission as _del_mission
+                                _del_mission(self.world, ent)
                             except Exception:
                                 pass
                             try:
@@ -155,10 +179,21 @@ class FleetMovementSystem(esper.Processor):
                             setattr(fleet, "colony_ship", max(0, c - 1))
                         except Exception:
                             pass
+                        # Persist updated fleet counts best-effort
+                        try:
+                            upsert_fleet(self.world, ent)
+                        except Exception:
+                            pass
 
                     # Remove movement regardless of success to end mission
                     try:
                         self.world.remove_component(ent, FleetMovement)
+                    except Exception:
+                        pass
+                    # Delete persisted mission best-effort
+                    try:
+                        from src.core.sync import delete_fleet_mission as _del_mission
+                        _del_mission(self.world, ent)
                     except Exception:
                         pass
 
@@ -294,6 +329,12 @@ class FleetMovementSystem(esper.Processor):
             except Exception:
                 # Non-fatal; continue processing
                 pass
+            # Delete persisted mission best-effort
+            try:
+                from src.core.sync import delete_fleet_mission as _del_mission
+                _del_mission(self.world, ent)
+            except Exception:
+                pass
 
             # Log the completion event
             try:
@@ -304,7 +345,7 @@ class FleetMovementSystem(esper.Processor):
                         "entity": ent,
                         "owner_id": getattr(movement, "owner_id", None),
                         "mission": getattr(movement, "mission", None),
-                        "timestamp": datetime.now().isoformat(),
+                        "timestamp": now.isoformat(),
                         "target": {
                             "g": pos.galaxy,
                             "s": pos.system,

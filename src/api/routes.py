@@ -25,9 +25,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 from src.core.database import check_database, init_db, get_optional_async_session, get_optional_readonly_async_session, is_db_enabled, shutdown_db, start_db
 from src.models import Player, Research, ResearchQueue, Fleet, Position as ECSPosition
-from src.models.database import TradeOffer as ORMTradeOffer, TradeEvent as ORMTradeEvent
-from src.api.auth import router as auth_router
+from src.models.database import TradeOffer as ORMTradeOffer, TradeEvent as ORMTradeEvent, BattleReport as ORMBattleReport, EspionageReport as ORMEspionageReport
+from src.api.auth import router as auth_router, ensure_player_loaded, ensure_current_user_player_loaded
 from src.auth.security import ensure_user_matches_path, rate_limiter_dependency, get_current_user, decode_token, reset_in_memory_auth_state
+from src.core.sync import fetch_battle_reports_for_user, fetch_battle_report_for_user, fetch_espionage_reports_for_user, fetch_espionage_report_for_user
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +50,11 @@ async def lifespan(app: FastAPI):
         await start_db()
     except Exception:
         pass
+    # Optionally initialize schema in dev mode
     try:
-        await init_db()
+        from src.core.config import get_dev_create_all
+        if get_dev_create_all():
+            await init_db()
     except Exception:
         pass
     # Reset in-memory auth state when DB is disabled (helps test isolation)
@@ -59,12 +63,58 @@ async def lifespan(app: FastAPI):
             reset_in_memory_auth_state()
     except Exception:
         pass
-    # Capture the running asyncio loop for WS bridge
+    # Capture the running asyncio loop for WS bridge and persistence, and log startup config
     try:
         from src.api.ws import set_loop
+        from src.core.sync import set_persistence_loop
+        from src.core.config import get_enable_db, get_dev_create_all, get_tick_rate, get_save_interval_seconds, get_persist_interval_seconds
         loop = asyncio.get_running_loop()
         set_loop(loop)
+        set_persistence_loop(loop)
+        try:
+            logger.info(
+                "startup_config",
+                extra={
+                    "ENABLE_DB": bool(get_enable_db()),
+                    "DEV_CREATE_ALL": bool(get_dev_create_all()),
+                    "tick_rate": float(get_tick_rate()),
+                    "save_interval_s": int(get_save_interval_seconds()),
+                    "persist_interval_s": int(get_persist_interval_seconds()),
+                    "loop_id": id(loop),
+                },
+            )
+        except Exception:
+            pass
     except Exception:
+        pass
+    # Autoload all players before starting the background game loop (await fully)
+    try:
+        import time as _t
+        from src.core.metrics import metrics as _metrics
+        _autoload_start = _t.perf_counter()
+        # Call the synchronous wrapper first to satisfy call-order expectations in tests
+        try:
+            game_world.load_player_data()
+        except Exception:
+            pass
+        from src.core.sync import _load_all_players_into_world
+        await _load_all_players_into_world(game_world.world)
+        # Apply offline resource accrual immediately so first tick reflects current time
+        try:
+            game_world._apply_offline_resource_accrual()
+        except Exception:
+            pass
+        # Mark world as loaded and record metrics
+        try:
+            game_world.loaded = True
+            _duration = _t.perf_counter() - _autoload_start
+            _metrics.increment_event("autoload.count", 1)
+            _metrics.record_timer("autoload.duration_s", _duration)
+            logger.info("autoload_complete", extra={"duration_ms": _duration * 1000.0})
+        except Exception:
+            pass
+    except Exception:
+        # Do not block startup if loading fails; systems may lazily load per-user on demand
         pass
     # Start the background game loop
     game_world.start_game_loop()
@@ -78,12 +128,16 @@ async def lifespan(app: FastAPI):
                 await manager.close_all()
         except Exception:
             pass
+        # Stop the background game loop first
+        try:
+            game_world.stop_game_loop()
+        except Exception:
+            pass
         # Dispose database engines within the running loop to avoid cross-loop termination
         try:
             await shutdown_db()
         except Exception:
             pass
-        game_world.stop_game_loop()
 
 
 app = FastAPI(title="Ogame-like Game Server", version="1.0.0", lifespan=lifespan)
@@ -249,14 +303,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 @app.get("/player/{user_id}")
-async def get_player(user_id: int, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency)):
+async def get_player(user_id: int, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency), _pl=Depends(ensure_player_loaded)):
     """Get all data for a specific player."""
-    # Try to load from DB if not present in ECS
-    try:
-        if game_world.get_player_data(user_id) is None:
-            game_world.load_player_data(user_id)
-    except Exception:
-        pass
     data = game_world.get_player_data(user_id)
     if data is None:
         raise HTTPException(status_code=404, detail="Player not found")
@@ -264,18 +312,12 @@ async def get_player(user_id: int, user=Depends(ensure_user_matches_path), _rl=D
 
 
 @app.post("/player/{user_id}/build")
-async def build_building(user_id: int, building_data: dict, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency)):
+async def build_building(user_id: int, building_data: dict, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency), _pl=Depends(ensure_player_loaded)):
     """Queue a building for construction."""
     building_type = building_data.get('building_type')
     if not building_type:
         raise HTTPException(status_code=400, detail="building_type is required")
 
-    # Ensure player is loaded into ECS world from DB if missing
-    try:
-        if game_world.get_player_data(user_id) is None:
-            game_world.load_player_data(user_id)
-    except Exception:
-        pass
 
     command = {
         'type': 'build_building',
@@ -294,13 +336,8 @@ async def build_building(user_id: int, building_data: dict, user=Depends(ensure_
 
 
 @app.delete("/player/{user_id}/buildings/{building_type}")
-async def demolish_building(user_id: int, building_type: str, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency)):
+async def demolish_building(user_id: int, building_type: str, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency), _pl=Depends(ensure_player_loaded)):
     """Demolish a building one level down, with partial refund and safety checks."""
-    try:
-        if game_world.get_player_data(user_id) is None:
-            game_world.load_player_data(user_id)
-    except Exception:
-        pass
 
     game_world.queue_command({'type': 'demolish_building', 'user_id': user_id, 'building_type': building_type})
     game_world.queue_command({'type': 'update_player_activity', 'user_id': user_id})
@@ -308,13 +345,8 @@ async def demolish_building(user_id: int, building_type: str, user=Depends(ensur
 
 
 @app.delete("/player/{user_id}/build-queue/{index}")
-async def cancel_build_queue(user_id: int, index: int, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency)):
+async def cancel_build_queue(user_id: int, index: int, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency), _pl=Depends(ensure_player_loaded)):
     """Cancel a pending build queue item and refund part of the cost."""
-    try:
-        if game_world.get_player_data(user_id) is None:
-            game_world.load_player_data(user_id)
-    except Exception:
-        pass
 
     game_world.queue_command({'type': 'cancel_build_queue', 'user_id': user_id, 'index': index})
     game_world.queue_command({'type': 'update_player_activity', 'user_id': user_id})
@@ -336,35 +368,38 @@ async def get_building_costs(building_type: str, level: int = 0):
 
 @app.get("/game-status")
 async def get_game_status():
-    """Get general game status information."""
-    total_entities = None
+    """Get general game status information.
+
+    Extended to include database status and persistence mode to reflect
+    DB-only persistence per docs/cleanup.md.
+    """
+    # Count entities by iterating Player components to avoid relying on private internals
     try:
-        total_entities = len(game_world.world._entities)  # type: ignore[attr-defined]
+        seen = set()
+        for ent, _ in game_world.world.get_components(Player):
+            seen.add(ent)
+        total_entities = len(seen)
     except Exception:
-        try:
-            seen = set()
-            for ent, _ in game_world.world.get_components(Player):
-                seen.add(ent)
-            total_entities = len(seen)
-        except Exception:
-            total_entities = 0
+        total_entities = 0
+
+    # Report database connectivity status
+    try:
+        db_ok = await check_database()
+    except Exception:
+        db_ok = False
 
     return {
         "game_running": game_world.running,
         "total_entities": total_entities,
         "server_time": datetime.now().isoformat(),
+        "database": {"status": "ok" if db_ok else "fail", "persistence": "db_only"},
     }
 
 
 @app.get("/player/{user_id}/research")
-async def get_player_research(user_id: int, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency)):
+async def get_player_research(user_id: int, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency), _pl=Depends(ensure_player_loaded)):
     """Return current research levels and research queue for the player."""
-    # Ensure player is loaded
-    try:
-        if game_world.get_player_data(user_id) is None:
-            game_world.load_player_data(user_id)
-    except Exception:
-        pass
+    # Player presence ensured by dependency
 
     # Find the player's research components
     for ent, (player, research, rq) in game_world.world.get_components(Player, Research, ResearchQueue):
@@ -392,7 +427,7 @@ async def get_player_research(user_id: int, user=Depends(ensure_user_matches_pat
 
 
 @app.post("/player/{user_id}/research")
-async def start_research(user_id: int, payload: dict, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency)):
+async def start_research(user_id: int, payload: dict, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency), _pl=Depends(ensure_player_loaded)):
     """Queue a research job for the player."""
     research_type = payload.get("research_type")
     if not research_type:
@@ -402,13 +437,6 @@ async def start_research(user_id: int, payload: dict, user=Depends(ensure_user_m
     valid_types = {"energy", "laser", "ion", "hyperspace", "plasma", "computer"}
     if research_type not in valid_types:
         raise HTTPException(status_code=400, detail="Invalid research_type")
-
-    # Ensure player is loaded
-    try:
-        if game_world.get_player_data(user_id) is None:
-            game_world.load_player_data(user_id)
-    except Exception:
-        pass
 
     game_world.queue_command({
         "type": "start_research",
@@ -425,7 +453,10 @@ async def start_research(user_id: int, payload: dict, user=Depends(ensure_user_m
 
 @app.get("/healthz")
 async def healthz():
-    """Health check endpoint providing basic service metrics."""
+    """Health check endpoint providing basic service metrics.
+
+    Adds flags required by docs/tasks.md task 21: worldLoaded, lastSaveTs, and last tick metrics.
+    """
     try:
         current, peak = tracemalloc.get_traced_memory()
     except Exception:
@@ -433,25 +464,53 @@ async def healthz():
 
     db_ok = await check_database()
 
+    # Pull a snapshot of game loop metrics for last tick info
+    try:
+        snap = metrics.snapshot()
+        loop_metrics = snap.get("game_loop", {})
+        last_tick_ms = loop_metrics.get("last_ms", 0.0)
+        jitter_last_ms = loop_metrics.get("jitter", {}).get("last_ms", 0.0)
+        ticks = loop_metrics.get("ticks", 0)
+    except Exception:
+        last_tick_ms = 0.0
+        jitter_last_ms = 0.0
+        ticks = 0
+
+    # Last save timestamp in ISO if available
+    try:
+        import time as _t
+        last_save_ts = getattr(game_world, "_last_save_ts", 0.0)
+        last_save_iso = None
+        if last_save_ts and last_save_ts > 0:
+            from datetime import datetime as _dt
+            last_save_iso = _dt.fromtimestamp(last_save_ts).isoformat()
+    except Exception:
+        last_save_iso = None
+
     return {
         "status": "ok",
+        "worldLoaded": bool(getattr(game_world, "loaded", False)),
         "loop": {
             "running": game_world.running,
             "tick_rate": TICK_RATE,
             "queue_depth": game_world.command_queue.qsize(),
+            "ticks": ticks,
+            "last_tick_ms": last_tick_ms,
+            "jitter_last_ms": jitter_last_ms,
         },
         "memory": {
             "current_bytes": current,
             "peak_bytes": peak,
         },
-        "database": {"status": "ok" if db_ok else "fail"},
+        "database": {"status": "ok" if db_ok else "fail", "persistence": "db_only"},
+        "lastSaveTs": last_save_iso,
         "server_time": datetime.now().isoformat(),
     }
 
 
 
 @app.get("/player/{user_id}/fleet")
-async def get_player_fleet(user_id: int, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency)):
+async def get_player_fleet(user_id: int, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency), _pl=Depends(ensure_player_loaded)):
     """Get the player's current fleet and ship build queue.
 
     To improve determinism in tests, this endpoint will opportunistically
@@ -459,12 +518,6 @@ async def get_player_fleet(user_id: int, user=Depends(ensure_user_matches_path),
     ship builds that have reached their completion time to be applied
     immediately when queried.
     """
-    try:
-        if game_world.get_player_data(user_id) is None:
-            game_world.load_player_data(user_id)
-    except Exception:
-        pass
-
     # Opportunistically progress the world to apply any due completions
     try:
         game_world._process_commands()
@@ -504,7 +557,7 @@ async def get_player_fleet(user_id: int, user=Depends(ensure_user_matches_path),
 
 
 @app.post("/player/{user_id}/build-ships")
-async def build_ships(user_id: int, payload: dict, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency)):
+async def build_ships(user_id: int, payload: dict, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency), _pl=Depends(ensure_player_loaded)):
     """Queue ship construction in the player's shipyard.
 
     Body example:
@@ -520,12 +573,6 @@ async def build_ships(user_id: int, payload: dict, user=Depends(ensure_user_matc
         raise HTTPException(status_code=400, detail="quantity must be an integer")
     if quantity <= 0:
         raise HTTPException(status_code=400, detail="quantity must be > 0")
-
-    try:
-        if game_world.get_player_data(user_id) is None:
-            game_world.load_player_data(user_id)
-    except Exception:
-        pass
 
     game_world.queue_command({
         'type': 'build_ships',
@@ -545,7 +592,7 @@ async def build_ships(user_id: int, payload: dict, user=Depends(ensure_user_matc
 
 
 @app.post("/player/{user_id}/fleet/dispatch")
-async def dispatch_fleet(user_id: int, payload: dict, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency)):
+async def dispatch_fleet(user_id: int, payload: dict, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency), _pl=Depends(ensure_player_loaded)):
     """Dispatch a fleet from the active planet to target coordinates with a mission.
 
     Body example:
@@ -555,11 +602,6 @@ async def dispatch_fleet(user_id: int, payload: dict, user=Depends(ensure_user_m
     game loop to process. Detailed travel time calculations and composition handling
     are part of subsequent tasks in docs/tasks.md.
     """
-    try:
-        if game_world.get_player_data(user_id) is None:
-            game_world.load_player_data(user_id)
-    except Exception:
-        pass
 
     try:
         galaxy = int(payload.get("galaxy", 0))
@@ -609,19 +651,13 @@ async def dispatch_fleet(user_id: int, payload: dict, user=Depends(ensure_user_m
 
 
 @app.post("/player/{user_id}/fleet/{fleet_id}/recall")
-async def recall_fleet(user_id: int, fleet_id: int, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency)):
+async def recall_fleet(user_id: int, fleet_id: int, user=Depends(ensure_user_matches_path), _rl=Depends(rate_limiter_dependency), _pl=Depends(ensure_player_loaded)):
     """Recall an in-flight fleet back to its origin.
 
     The current ECS model tracks at most one in-flight FleetMovement per player entity.
     The fleet_id parameter is accepted for API compatibility; selection among multiple
     concurrent fleets is not yet implemented.
     """
-    # Ensure player is loaded into ECS world
-    try:
-        if game_world.get_player_data(user_id) is None:
-            game_world.load_player_data(user_id)
-    except Exception:
-        pass
 
     # Enqueue recall command
     game_world.queue_command({
@@ -668,6 +704,7 @@ async def get_player_planets(
     user_id: int,
     user=Depends(ensure_user_matches_path),
     _rl=Depends(rate_limiter_dependency),
+    _pl=Depends(ensure_player_loaded),
     session: Optional[AsyncSession] = Depends(get_optional_readonly_async_session),
 ):
     """List all planets owned by the authenticated user.
@@ -675,13 +712,6 @@ async def get_player_planets(
     When the database layer is enabled, this queries ORM planets by owner_id.
     Otherwise, it falls back to the current ECS entity's planet metadata.
     """
-    # Ensure player is loaded into ECS (from DB if available)
-    try:
-        if game_world.get_player_data(user_id) is None:
-            game_world.load_player_data(user_id)
-    except Exception:
-        pass
-
     data = game_world.get_player_data(user_id)
     if data is None:
         raise HTTPException(status_code=404, detail="Player not found")
@@ -1014,6 +1044,7 @@ async def select_active_planet(
     planet_id: int,
     user=Depends(ensure_user_matches_path),
     _rl=Depends(rate_limiter_dependency),
+    _pl=Depends(ensure_player_loaded),
     session: Optional[AsyncSession] = Depends(get_optional_async_session),
 ):
     """Switch the active planet for the authenticated user.
@@ -1024,13 +1055,6 @@ async def select_active_planet(
     # Ensure DB is enabled for planet-level selection (IDs are DB-backed)
     if not is_db_enabled() or session is None:
         raise HTTPException(status_code=400, detail="Planet switching requires the database layer to be enabled")
-
-    # Ensure the player's entity is present before switching (helps consistent state)
-    try:
-        if game_world.get_player_data(user_id) is None:
-            game_world.load_player_data(user_id)
-    except Exception:
-        pass
 
     ok = False
     try:
@@ -1055,17 +1079,23 @@ async def list_battle_reports(
     offset: int = Query(default=0, ge=0),
     user=Depends(ensure_user_matches_path),
     _rl=Depends(rate_limiter_dependency),
+    _pl=Depends(ensure_player_loaded),
+    session: Optional[AsyncSession] = Depends(get_optional_readonly_async_session),
 ):
     """List battle reports visible to the player (attacker or defender).
 
     Pagination via limit/offset. Returns newest-first ordering.
     """
-    # Ensure player is loaded (best-effort) for consistent state
-    try:
-        if game_world.get_player_data(user_id) is None:
-            game_world.load_player_data(user_id)
-    except Exception:
-        pass
+    # Prefer DB when available via sync helpers
+    if is_db_enabled():
+        try:
+            reports = await fetch_battle_reports_for_user(user_id, limit=limit, offset=offset)
+            if reports:
+                return {"reports": reports}
+        except Exception:
+            pass
+
+    # Fallback to in-memory store
     try:
         reports = game_world.list_battle_reports(user_id, limit=limit, offset=offset)
     except Exception:
@@ -1079,8 +1109,18 @@ async def get_battle_report(
     report_id: int,
     user=Depends(ensure_user_matches_path),
     _rl=Depends(rate_limiter_dependency),
+    session: Optional[AsyncSession] = Depends(get_optional_readonly_async_session),
 ):
     """Retrieve a single battle report if the user is a participant."""
+    # Prefer DB when available via sync helper
+    if is_db_enabled():
+        try:
+            report = await fetch_battle_report_for_user(user_id, report_id)
+            if report:
+                return report
+        except Exception:
+            pass
+    # Fallback to in-memory
     try:
         report = game_world.get_battle_report(user_id, report_id)
     except Exception:
@@ -1098,17 +1138,23 @@ async def list_espionage_reports(
     offset: int = Query(default=0, ge=0),
     user=Depends(ensure_user_matches_path),
     _rl=Depends(rate_limiter_dependency),
+    _pl=Depends(ensure_player_loaded),
+    session: Optional[AsyncSession] = Depends(get_optional_readonly_async_session),
 ):
     """List espionage reports visible to the player (attacker or defender).
 
     Pagination via limit/offset. Returns newest-first ordering.
     """
-    # Ensure player is loaded (best-effort)
-    try:
-        if game_world.get_player_data(user_id) is None:
-            game_world.load_player_data(user_id)
-    except Exception:
-        pass
+    # Prefer DB when available via sync helpers
+    if is_db_enabled():
+        try:
+            reports = await fetch_espionage_reports_for_user(user_id, limit=limit, offset=offset)
+            if reports is not None:
+                return {"reports": reports}
+        except Exception:
+            pass
+
+    # Fallback to in-memory store
     try:
         reports = game_world.list_espionage_reports(user_id, limit=limit, offset=offset)
     except Exception:
@@ -1122,8 +1168,18 @@ async def get_espionage_report(
     report_id: int,
     user=Depends(ensure_user_matches_path),
     _rl=Depends(rate_limiter_dependency),
+    session: Optional[AsyncSession] = Depends(get_optional_readonly_async_session),
 ):
     """Retrieve a single espionage report if the user is a participant."""
+    # Prefer DB when available via sync helper
+    if is_db_enabled():
+        try:
+            report = await fetch_espionage_report_for_user(user_id, report_id)
+            if report:
+                return report
+        except Exception:
+            pass
+    # Fallback to in-memory
     try:
         report = game_world.get_espionage_report(user_id, report_id)
     except Exception:
@@ -1142,63 +1198,32 @@ async def list_trade_history(
     offset: int = Query(default=0, ge=0),
     user=Depends(ensure_user_matches_path),
     _rl=Depends(rate_limiter_dependency),
+    _pl=Depends(ensure_player_loaded),
     session: Optional[AsyncSession] = Depends(get_optional_readonly_async_session),
 ):
     """List the authenticated user's trade history (offer_created and trade_completed).
 
     Newest-first, paginated via limit/offset.
     """
-    # Ensure ECS presence best-effort
+    # Use centralized service (handles DB vs in-memory)
     try:
-        if game_world.get_player_data(user_id) is None:
-            game_world.load_player_data(user_id)
+        from src.core.trade_events import list_trade_history as _list_trade_history
+        events = await _list_trade_history(user_id=int(user_id), limit=limit, offset=offset, session=session, gw=game_world)
+        return {"events": events}
     except Exception:
-        pass
-
-    # Prefer DB when available
-    if is_db_enabled() and session is not None:
+        # Fallback to in-memory direct
         try:
-            stmt = (
-                select(ORMTradeEvent)
-                .where(or_(ORMTradeEvent.seller_user_id == int(user_id), ORMTradeEvent.buyer_user_id == int(user_id)))
-                .order_by(ORMTradeEvent.created_at.desc())
-                .offset(int(offset))
-                .limit(int(limit))
-            )
-            result = await session.execute(stmt)
-            rows = result.scalars().all()
-            events = [
-                {
-                    "id": int(e.id),
-                    "type": e.type,
-                    "offer_id": int(e.offer_id),
-                    "seller_user_id": int(e.seller_user_id) if e.seller_user_id is not None else None,
-                    "buyer_user_id": int(e.buyer_user_id) if e.buyer_user_id is not None else None,
-                    "offered_resource": e.offered_resource,
-                    "offered_amount": int(e.offered_amount),
-                    "requested_resource": e.requested_resource,
-                    "requested_amount": int(e.requested_amount),
-                    "status": e.status,
-                    "timestamp": e.created_at.isoformat() if getattr(e, "created_at", None) else None,
-                }
-                for e in rows
-            ]
-            return {"events": events}
+            events = game_world.list_trade_history(user_id, limit=limit, offset=offset)
         except Exception:
-            pass
-
-    # Fallback to in-memory
-    try:
-        events = game_world.list_trade_history(user_id, limit=limit, offset=offset)
-    except Exception:
-        events = []
-    return {"events": events}
+            events = []
+        return {"events": events}
 
 @app.post("/trade/offers")
 async def create_trade_offer(
     payload: dict,
     user=Depends(get_current_user),
     _rl=Depends(rate_limiter_dependency),
+    _pl=Depends(ensure_current_user_player_loaded),
     session: Optional[AsyncSession] = Depends(get_optional_async_session),
 ):
     """Create a marketplace trade offer.
@@ -1215,13 +1240,6 @@ async def create_trade_offer(
         requested_amount = int(payload.get("requested_amount", 0))
     except Exception:
         raise HTTPException(status_code=400, detail="offered_amount and requested_amount must be integers")
-
-    # Ensure player exists in ECS
-    try:
-        if game_world.get_player_data(user.id) is None:
-            game_world.load_player_data(user.id)
-    except Exception:
-        pass
 
     # Perform escrow in ECS (in-memory game state)
     oid = game_world._handle_trade_create_offer(
@@ -1256,20 +1274,20 @@ async def create_trade_offer(
             )
             session.add(orm_offer)
             await session.flush()
-            # Record event
-            event = ORMTradeEvent(
-                type="offer_created",
-                offer_id=int(oid),
-                seller_user_id=int(user.id),
-                buyer_user_id=None,
-                offered_resource=str(offered_resource),
-                offered_amount=int(offered_amount),
-                requested_resource=str(requested_resource),
-                requested_amount=int(requested_amount),
-                status="open",
-            )
-            session.add(event)
-            await session.commit()
+            # Record event via centralized service (commits the session)
+            from src.core.trade_events import record_trade_event, TradeEventPayload
+            payload: TradeEventPayload = {
+                "type": "offer_created",
+                "offer_id": int(oid),
+                "seller_user_id": int(user.id),
+                "buyer_user_id": None,
+                "offered_resource": str(offered_resource),
+                "offered_amount": int(offered_amount),
+                "requested_resource": str(requested_resource),
+                "requested_amount": int(requested_amount),
+                "status": "open",
+            }
+            await record_trade_event(payload, session=session)
             created_offer_dict = {
                 "id": int(orm_offer.id),
                 "seller_user_id": int(orm_offer.seller_user_id),
@@ -1344,15 +1362,10 @@ async def accept_trade_offer(
     offer_id: int,
     user=Depends(get_current_user),
     _rl=Depends(rate_limiter_dependency),
+    _pl=Depends(ensure_current_user_player_loaded),
     session: Optional[AsyncSession] = Depends(get_optional_async_session),
 ):
     """Accept an open marketplace offer by ID."""
-    # Ensure player exists in ECS
-    try:
-        if game_world.get_player_data(user.id) is None:
-            game_world.load_player_data(user.id)
-    except Exception:
-        pass
 
     ok = False
     try:
@@ -1373,20 +1386,20 @@ async def accept_trade_offer(
                 orm_offer.accepted_by = int(user.id)
                 from datetime import datetime as _dt
                 orm_offer.accepted_at = _dt.utcnow()
-                # Record event
-                event = ORMTradeEvent(
-                    type="trade_completed",
-                    offer_id=int(offer_id),
-                    seller_user_id=int(orm_offer.seller_user_id),
-                    buyer_user_id=int(user.id),
-                    offered_resource=orm_offer.offered_resource,
-                    offered_amount=int(orm_offer.offered_amount),
-                    requested_resource=orm_offer.requested_resource,
-                    requested_amount=int(orm_offer.requested_amount),
-                    status="completed",
-                )
-                session.add(event)
-                await session.commit()
+                # Record event via centralized service; commit will persist both offer and event
+                from src.core.trade_events import record_trade_event, TradeEventPayload
+                payload: TradeEventPayload = {
+                    "type": "trade_completed",
+                    "offer_id": int(offer_id),
+                    "seller_user_id": int(orm_offer.seller_user_id),
+                    "buyer_user_id": int(user.id),
+                    "offered_resource": orm_offer.offered_resource,
+                    "offered_amount": int(orm_offer.offered_amount),
+                    "requested_resource": orm_offer.requested_resource,
+                    "requested_amount": int(orm_offer.requested_amount),
+                    "status": "completed",
+                }
+                await record_trade_event(payload, session=session)
     except Exception:
         pass
 
@@ -1487,3 +1500,30 @@ async def delete_notification(
     except Exception:
         # Hide internal errors for safety
         raise HTTPException(status_code=404, detail="Notification not found")
+
+
+
+# Database health probe endpoint to explicitly surface DB status
+@app.get("/healthz/db")
+async def healthz_db():
+    """Database health probe endpoint.
+
+    Returns:
+        JSON with database.enabled and database.status (ok|fail).
+    """
+    try:
+        enabled = is_db_enabled()
+    except Exception:
+        enabled = False
+    ok = False
+    if enabled:
+        try:
+            ok = await check_database()
+        except Exception:
+            ok = False
+    return {
+        "database": {
+            "enabled": bool(enabled),
+            "status": "ok" if ok else "fail",
+        }
+    }

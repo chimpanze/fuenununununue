@@ -1,8 +1,8 @@
 """Alembic environment configuration.
 
 This lightweight env.py references SQLAlchemy metadata from src.models.database:Base
-and supports both offline and online migrations. For async URLs like
-sqlite+aiosqlite, it falls back to a sync driver for migration execution.
+and supports both offline and online migrations. For async URLs, a sync driver is used
+when required by Alembic (e.g., asyncpg -> postgresql).
 """
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from logging.config import fileConfig
 import os
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool, create_engine
+from sqlalchemy import pool, create_engine
 
 from src.models.database import Base
 
@@ -33,10 +33,8 @@ target_metadata = Base.metadata
 
 
 def get_url() -> str:
-    url = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./dev.db")
-    # Use sync driver for Alembic engine
-    if url.startswith("sqlite+aiosqlite"):
-        url = url.replace("sqlite+aiosqlite", "sqlite")
+    url = os.environ.get("DATABASE_URL", "postgresql+asyncpg://ogame:ogame@localhost:5432/ogame")
+    # Use sync driver for Alembic engine when using async URLs
     if url.startswith("postgresql+asyncpg"):
         url = url.replace("postgresql+asyncpg", "postgresql")
     return url

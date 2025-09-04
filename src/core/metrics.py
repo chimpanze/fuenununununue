@@ -21,6 +21,7 @@ class Stat:
     """Accumulates basic statistics for durations.
 
     Stores count, total seconds, min/max seconds, and last observed seconds.
+    Also retains a bounded sample window to estimate tail latencies (p95/p99).
     """
 
     count: int = 0
@@ -28,6 +29,9 @@ class Stat:
     min_s: float = float("inf")
     max_s: float = 0.0
     last_s: float = 0.0
+    # Bounded recent samples for percentile estimation
+    _samples: list[float] = field(default_factory=list)
+    _max_samples: int = 256
 
     def add(self, duration_s: float) -> None:
         self.count += 1
@@ -37,6 +41,18 @@ class Stat:
             self.min_s = duration_s
         if duration_s > self.max_s:
             self.max_s = duration_s
+        # Maintain bounded sample buffer
+        self._samples.append(duration_s)
+        if len(self._samples) > self._max_samples:
+            # Drop oldest
+            self._samples.pop(0)
+
+    def _percentile_ms(self, p: float) -> float:
+        if not self._samples:
+            return 0.0
+        data = sorted(self._samples)
+        k = max(0, min(len(data) - 1, int(round((p / 100.0) * (len(data) - 1)))))
+        return data[k] * 1000.0
 
     def as_dict_ms(self) -> Dict[str, float | int]:
         # Present values in milliseconds for readability
@@ -48,6 +64,8 @@ class Stat:
             "min_ms": (self.min_s * 1000.0 if self.count else 0.0),
             "max_ms": self.max_s * 1000.0,
             "last_ms": self.last_s * 1000.0,
+            "p95_ms": self._percentile_ms(95.0),
+            "p99_ms": self._percentile_ms(99.0),
         }
 
 
@@ -68,10 +86,28 @@ class MetricsCollector:
         # Game loop metrics
         self._tick_stats: Stat = Stat()
         self._tick_total: int = 0
+        # Tick jitter metrics (absolute deviation between planned and actual start)
+        self._tick_jitter: Stat = Stat()
+
+        # DB/event counters (e.g., persistence operations)
+        self._events: Dict[str, int] = {}
+        # Generic timers by name (durations recorded as Stat)
+        self._timers: Dict[str, Stat] = {}
 
         # Process start time
         self._start_monotonic: float = time.monotonic()
         self._start_time_s: float = time.time()
+
+    def increment_event(self, key: str, count: int = 1) -> None:
+        """Increment a named event counter by count (default 1).
+
+        Safe to call from any thread; keys are arbitrary strings like
+        'db.trade_event_recorded' or 'db.ship_build_completed'.
+        """
+        if not key:
+            return
+        with self._lock:
+            self._events[key] = int(self._events.get(key, 0)) + int(count)
 
     def record_http(self, method: str, route: str, status_code: int, duration_s: float) -> None:
         key = (method.upper(), route)
@@ -85,10 +121,26 @@ class MetricsCollector:
             self._http_status_counts[key][sc] = self._http_status_counts[key].get(sc, 0) + 1
             self._http_total += 1
 
-    def record_tick(self, duration_s: float) -> None:
+    def record_tick(self, duration_s: float, jitter_s: Optional[float] = None) -> None:
         with self._lock:
             self._tick_stats.add(duration_s)
+            if jitter_s is not None:
+                # store absolute jitter magnitude for readability
+                self._tick_jitter.add(abs(jitter_s))
             self._tick_total += 1
+
+    def record_timer(self, name: str, duration_s: float) -> None:
+        """Record a one-shot timer duration under the given name.
+
+        Useful for operations like 'save.duration_s' or 'autoload.duration_s'.
+        """
+        if not name:
+            return
+        with self._lock:
+            stat = self._timers.get(name)
+            if stat is None:
+                stat = self._timers[name] = Stat()
+            stat.add(float(duration_s))
 
     def uptime_s(self) -> float:
         return max(0.0, time.monotonic() - self._start_monotonic)
@@ -104,6 +156,12 @@ class MetricsCollector:
                 }
 
             tick = self._tick_stats.as_dict_ms()
+            jitter = self._tick_jitter.as_dict_ms()
+            # Timers snapshot
+            timers_by_name: Dict[str, Dict[str, Any]] = {}
+            for name, stat in self._timers.items():
+                timers_by_name[name] = stat.as_dict_ms()
+
             return {
                 "process": {
                     "started_at": self._start_time_s,
@@ -116,7 +174,10 @@ class MetricsCollector:
                 "game_loop": {
                     "ticks": self._tick_total,
                     **tick,
+                    "jitter": jitter,
                 },
+                "events": dict(self._events),
+                "timers": timers_by_name,
             }
 
 

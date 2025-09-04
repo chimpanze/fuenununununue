@@ -24,6 +24,7 @@ services:
       CORS_ALLOW_METHODS: "*"
       CORS_ALLOW_HEADERS: "*"
       REQUIRE_START_CHOICE: true
+      ENABLE_DB: true
     depends_on:
       - db
     volumes:

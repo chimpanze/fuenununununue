@@ -260,7 +260,12 @@ paths:
   /game-status:
     get:
       summary: Get Game Status
-      description: Get general game status information.
+      description: 'Get general game status information.
+
+
+        Extended to include database status and persistence mode to reflect
+
+        DB-only persistence per docs/cleanup.md.'
       operationId: get_game_status_game_status_get
       responses:
         '200':
@@ -330,7 +335,11 @@ paths:
   /healthz:
     get:
       summary: Healthz
-      description: Health check endpoint providing basic service metrics.
+      description: 'Health check endpoint providing basic service metrics.
+
+
+        Adds flags required by docs/tasks.md task 21: worldLoaded, lastSaveTs, and
+        last tick metrics.'
       operationId: healthz_healthz_get
       responses:
         '200':
@@ -1078,6 +1087,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /healthz/db:
+    get:
+      summary: Healthz Db
+      description: "Database health probe endpoint.\n\nReturns:\n    JSON with database.enabled\
+        \ and database.status (ok|fail)."
+      operationId: healthz_db_healthz_db_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
 components:
   schemas:
     HTTPValidationError:

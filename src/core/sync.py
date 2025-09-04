@@ -14,18 +14,110 @@ impacting game loop stability.
 
 import asyncio
 import logging
-from typing import Optional, Dict
+import threading
+from typing import Optional, Dict, List
+from src.core.time_utils import utc_now, ensure_aware_utc, parse_utc
 
 try:
-    from sqlalchemy import select
+    from sqlalchemy import select, update, delete
     from sqlalchemy.exc import SQLAlchemyError
-    from src.core.database import SessionLocal, is_db_enabled
-    from src.models.database import User as ORMUser, Planet as ORMPlanet, Building as ORMBuilding
-    _DB_AVAILABLE = is_db_enabled()
+    import src.core.database as db
+    from src.models.database import User as ORMUser, Planet as ORMPlanet, Building as ORMBuilding, Fleet as ORMFleet, Research as ORMResearch, ShipBuildQueueItem as ORMSBQ, FleetMission as ORMFleetMission, BattleReport as ORMBattleReport, EspionageReport as ORMEspionageReport, BuildingQueueItem as ORMBQI, ResearchQueueItem as ORMRQI
+    _DB_AVAILABLE = db.is_db_enabled()
 except Exception:  # pragma: no cover - defensive import for environments without deps
     _DB_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+from src.core.metrics import metrics
+
+# Captured FastAPI server loop used for DB persistence scheduling
+_persistence_loop: Optional[asyncio.AbstractEventLoop] = None
+
+def set_persistence_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Record the owning asyncio loop for DB operations.
+    Safe to call once on FastAPI startup.
+    """
+    global _persistence_loop
+    _persistence_loop = loop
+    try:
+        logger.debug(
+            "persistence_loop_set",
+            extra={
+                "thread": threading.current_thread().name,
+                "loop_id": id(loop),
+            },
+        )
+    except Exception:
+        pass
+
+
+def _submit(coro, *, default=None, op: str = ""):
+    """Schedule a coroutine on the captured persistence loop without waiting.
+
+    Returns the provided default immediately. If the loop is not set, the call is a no-op.
+    """
+    loop = _persistence_loop
+    if loop is None:
+        try:
+            logger.debug("persistence_loop_missing for %s", op)
+        except Exception:
+            pass
+        return default
+    try:
+        asyncio.run_coroutine_threadsafe(coro, loop)
+        try:
+            logger.debug(
+                "persistence_submit",
+                extra={
+                    "op": op or getattr(getattr(coro, "__name__", None), "__str__", lambda: "")(),
+                    "thread": threading.current_thread().name,
+                    "loop_id": id(loop),
+                },
+            )
+        except Exception:
+            pass
+    except Exception as exc:
+        try:
+            logger.debug("persistence_submit_failed %s: %s", op, exc)
+        except Exception:
+            pass
+    return default
+
+
+def _submit_and_wait(coro, *, timeout: float = 2.0, default=None, op: str = ""):
+    """Submit a coroutine to the captured loop and wait for a result briefly.
+
+    Intended for read operations invoked from non-async, non-loop threads during
+    startup or administrative flows. Falls back to default on timeout or errors.
+    """
+    loop = _persistence_loop
+    if loop is None:
+        try:
+            logger.debug("persistence_loop_missing(wait) for %s", op)
+        except Exception:
+            pass
+        return default
+    try:
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        return fut.result(timeout=timeout)
+    except Exception as exc:
+        try:
+            logger.debug("persistence_wait_failed %s: %s", op, exc)
+        except Exception:
+            pass
+        return default
+
+
+# Dynamic proxy to access SessionLocal at call time to reflect latest value from src.core.database
+class _SessionLocalProxy:
+    def __call__(self, *args, **kwargs):
+        from src.core.database import SessionLocal as _SessionLocal  # dynamic lookup
+        if _SessionLocal is None:
+            raise RuntimeError("Database SessionLocal is not initialized")
+        return _SessionLocal(*args, **kwargs)
+
+# Expose name used throughout this module
+SessionLocal = _SessionLocalProxy()
 
 def _db_available() -> bool:
     try:
@@ -35,7 +127,8 @@ def _db_available() -> bool:
         return False
 
 # Persistence throttling (per planet key) to avoid excessive writes
-PERSIST_INTERVAL_SECONDS: int = 60
+# Centralized via src.core.config.PERSIST_INTERVAL_SECONDS
+from src.core.config import PERSIST_INTERVAL_SECONDS
 _last_persist: Dict[str, float] = {}
 
 # -----------------
@@ -84,16 +177,12 @@ async def _create_colony(user_id: int, username: str, galaxy: int, system: int, 
 def create_colony(user_id: int, username: str, galaxy: int, system: int, position: int, planet_name: str = "Colony") -> bool:
     """Synchronous wrapper for _create_colony used from the game loop thread.
 
-    Avoid creating an unawaited coroutine when already inside a running loop.
+    Schedules work on the captured persistence loop and returns True if queued.
+    Falls back to False on errors.
     """
     try:
-        # If there is a running loop, schedule task and return best-effort success
-        loop = asyncio.get_running_loop()
-        loop.create_task(_create_colony(user_id, username, galaxy, system, position, planet_name))
+        _submit(_create_colony(user_id, username, galaxy, system, position, planet_name), op="create_colony")
         return True
-    except RuntimeError:
-        # No running loop; safe to run synchronously
-        return asyncio.run(_create_colony(user_id, username, galaxy, system, position, planet_name))
     except Exception as exc:  # pragma: no cover
         logger.debug("create_colony wrapper failed: %s", exc)
         return False
@@ -114,51 +203,58 @@ def _should_persist(user_id: int, galaxy: int, system: int, position: int) -> bo
     return False
 
 
+async def _ensure_user_and_planet_in_session(session, user_id: int, username: str, galaxy: int, system: int, position: int,
+                                  planet_name: str, resources: Optional[dict] = None) -> Optional[ORMPlanet]:
+    """Ensure user and planet exist within the given session and return the ORMPlanet bound to it."""
+    # Ensure user exists
+    result = await session.execute(select(ORMUser).where(ORMUser.id == user_id))
+    user = result.scalar_one_or_none()
+    if user is None:
+        user = ORMUser(id=user_id, username=username, email=None, password_hash=None)
+        session.add(user)
+        await session.flush()
+
+    # Ensure planet exists by owner+coords
+    result = await session.execute(
+        select(ORMPlanet).where(
+            (ORMPlanet.owner_id == user_id) &
+            (ORMPlanet.galaxy == galaxy) &
+            (ORMPlanet.system == system) &
+            (ORMPlanet.position == position)
+        )
+    )
+    planet = result.scalar_one_or_none()
+    if planet is None:
+        planet = ORMPlanet(
+            name=planet_name or "Homeworld",
+            owner_id=user_id,
+            galaxy=galaxy,
+            system=system,
+            position=position,
+        )
+        if resources:
+            planet.metal = resources.get("metal", planet.metal)
+            planet.crystal = resources.get("crystal", planet.crystal)
+            planet.deuterium = resources.get("deuterium", planet.deuterium)
+        session.add(planet)
+        await session.flush()
+
+    # Apply initial resources if provided for existing planet (first sync)
+    if resources and (planet.metal, planet.crystal, planet.deuterium) == (500, 300, 100):
+        planet.metal = resources.get("metal", planet.metal)
+        planet.crystal = resources.get("crystal", planet.crystal)
+        planet.deuterium = resources.get("deuterium", planet.deuterium)
+
+    return planet
+
+
 async def _ensure_user_and_planet(user_id: int, username: str, galaxy: int, system: int, position: int,
                                   planet_name: str, resources: Optional[dict] = None) -> Optional[ORMPlanet]:
     if not _db_available():
         return None
     try:
         async with SessionLocal() as session:
-            # Ensure user exists
-            result = await session.execute(select(ORMUser).where(ORMUser.id == user_id))
-            user = result.scalar_one_or_none()
-            if user is None:
-                user = ORMUser(id=user_id, username=username, email=None, password_hash=None)
-                session.add(user)
-                await session.flush()
-
-            # Ensure planet exists by owner+coords
-            result = await session.execute(
-                select(ORMPlanet).where(
-                    (ORMPlanet.owner_id == user_id) &
-                    (ORMPlanet.galaxy == galaxy) &
-                    (ORMPlanet.system == system) &
-                    (ORMPlanet.position == position)
-                )
-            )
-            planet = result.scalar_one_or_none()
-            if planet is None:
-                planet = ORMPlanet(
-                    name=planet_name or "Homeworld",
-                    owner_id=user_id,
-                    galaxy=galaxy,
-                    system=system,
-                    position=position,
-                )
-                if resources:
-                    planet.metal = resources.get("metal", planet.metal)
-                    planet.crystal = resources.get("crystal", planet.crystal)
-                    planet.deuterium = resources.get("deuterium", planet.deuterium)
-                session.add(planet)
-                await session.flush()
-
-            # Apply initial resources if provided for existing planet (first sync)
-            if resources and (planet.metal, planet.crystal, planet.deuterium) == (500, 300, 100):
-                planet.metal = resources.get("metal", planet.metal)
-                planet.crystal = resources.get("crystal", planet.crystal)
-                planet.deuterium = resources.get("deuterium", planet.deuterium)
-
+            planet = await _ensure_user_and_planet_in_session(session, user_id, username, galaxy, system, position, planet_name, resources)
             await session.commit()
             return planet
     except SQLAlchemyError as exc:  # pragma: no cover - resilience path
@@ -171,7 +267,7 @@ async def sync_planet_resources_by_entity(world, ent) -> None:
 
     Expects the entity to have components: Player, Position, Planet, Resources, ResourceProduction.
     """
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return
     try:
         from src.models import Player, Position, Planet as PlanetComp, Resources, ResourceProduction
@@ -190,30 +286,28 @@ async def sync_planet_resources_by_entity(world, ent) -> None:
 
     try:
         async with SessionLocal() as session:
-            planet = await _ensure_user_and_planet(
+            planet = await _ensure_user_and_planet_in_session(
+                session,
                 player.user_id, player.name, pos.galaxy, pos.system, pos.planet, pmeta.name,
                 resources={"metal": res.metal, "crystal": res.crystal, "deuterium": res.deuterium},
             )
             if planet is None:
                 return
-            # Re-fetch within current session to update
-            result = await session.execute(select(ORMPlanet).where(ORMPlanet.id == planet.id))
-            planet = result.scalar_one()
             planet.metal = res.metal
             planet.crystal = res.crystal
             planet.deuterium = res.deuterium
             planet.metal_rate = float(prod.metal_rate)
             planet.crystal_rate = float(prod.crystal_rate)
             planet.deuterium_rate = float(prod.deuterium_rate)
-            planet.last_update = prod.last_update
+            planet.last_update = ensure_aware_utc(prod.last_update)
             await session.commit()
     except SQLAlchemyError as exc:  # pragma: no cover
-        logger.warning("DB sync_planet_resources failed: %s", exc)
+        logger.debug("DB sync_planet_resources failed (transient): %s", exc)
 
 
 async def upsert_building_level_by_entity(world, ent, building_type: str, level: int) -> None:
     """Upsert a Building row for the entity's planet and set its level."""
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return
     try:
         from src.models import Player, Position, Planet as PlanetComp
@@ -226,7 +320,8 @@ async def upsert_building_level_by_entity(world, ent, building_type: str, level:
 
     try:
         async with SessionLocal() as session:
-            planet = await _ensure_user_and_planet(
+            planet = await _ensure_user_and_planet_in_session(
+                session,
                 player.user_id, player.name, pos.galaxy, pos.system, pos.planet, pmeta.name
             )
             if planet is None:
@@ -245,32 +340,31 @@ async def upsert_building_level_by_entity(world, ent, building_type: str, level:
                 b.level = int(level)
             await session.commit()
     except SQLAlchemyError as exc:  # pragma: no cover
-        logger.warning("DB upsert_building_level failed: %s", exc)
+        logger.debug("DB upsert_building_level failed (transient): %s", exc)
 
 
 def sync_planet_resources(world, ent) -> None:
-    """Synchronous wrapper safe to call from Esper systems."""
-    if not _DB_AVAILABLE:
+    """Synchronous wrapper safe to call from Esper systems.
+
+    Off-thread DB work is scheduled on the FastAPI server loop via run_coroutine_threadsafe.
+    """
+    if not _db_available():
         return
     try:
-        asyncio.run(sync_planet_resources_by_entity(world, ent))
-    except RuntimeError:
-        # Already inside an event loop (unlikely in our game thread); schedule task
-        loop = asyncio.get_event_loop()
-        loop.create_task(sync_planet_resources_by_entity(world, ent))
+        _submit(sync_planet_resources_by_entity(world, ent), op="sync_planet_resources_by_entity")
     except Exception as exc:  # pragma: no cover
         logger.debug("sync_planet_resources wrapper failed: %s", exc)
 
 
 def sync_building_level(world, ent, building_type: str, level: int) -> None:
-    """Synchronous wrapper to upsert building level for given entity."""
-    if not _DB_AVAILABLE:
+    """Synchronous wrapper to upsert building level for given entity.
+
+    Off-thread DB work is scheduled on the FastAPI server loop via run_coroutine_threadsafe.
+    """
+    if not _db_available():
         return
     try:
-        asyncio.run(upsert_building_level_by_entity(world, ent, building_type, level))
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        loop.create_task(upsert_building_level_by_entity(world, ent, building_type, level))
+        _submit(upsert_building_level_by_entity(world, ent, building_type, level), op="upsert_building_level_by_entity")
     except Exception as exc:  # pragma: no cover
         logger.debug("sync_building_level wrapper failed: %s", exc)
 
@@ -282,58 +376,54 @@ async def sync_planet_resources_with_payload(user_id: int, username: str, galaxy
                                              planet_name: str, metal: int, crystal: int, deuterium: int,
                                              metal_rate: float, crystal_rate: float, deuterium_rate: float,
                                              last_update) -> None:
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return
     try:
         async with SessionLocal() as session:
-            planet = await _ensure_user_and_planet(
+            planet = await _ensure_user_and_planet_in_session(
+                session,
                 user_id, username, galaxy, system, position, planet_name,
                 resources={"metal": metal, "crystal": crystal, "deuterium": deuterium},
             )
             if planet is None:
                 return
-            result = await session.execute(select(ORMPlanet).where(ORMPlanet.id == planet.id))
-            planet = result.scalar_one()
             planet.metal = metal
             planet.crystal = crystal
             planet.deuterium = deuterium
             planet.metal_rate = float(metal_rate)
             planet.crystal_rate = float(crystal_rate)
             planet.deuterium_rate = float(deuterium_rate)
-            planet.last_update = last_update
+            planet.last_update = ensure_aware_utc(parse_utc(last_update))
             await session.commit()
     except SQLAlchemyError as exc:  # pragma: no cover
-        logger.warning("DB sync_planet_resources_with_payload failed: %s", exc)
+        logger.debug("DB sync_planet_resources_with_payload failed (transient): %s", exc)
 
 
 def sync_planet_resources_payload(user_id: int, username: str, galaxy: int, system: int, position: int,
                                   planet_name: str, metal: int, crystal: int, deuterium: int,
                                   metal_rate: float, crystal_rate: float, deuterium_rate: float,
                                   last_update) -> None:
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return
     try:
-        asyncio.run(sync_planet_resources_with_payload(
-            user_id, username, galaxy, system, position, planet_name,
-            metal, crystal, deuterium, metal_rate, crystal_rate, deuterium_rate, last_update
-        ))
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        loop.create_task(sync_planet_resources_with_payload(
-            user_id, username, galaxy, system, position, planet_name,
-            metal, crystal, deuterium, metal_rate, crystal_rate, deuterium_rate, last_update
-        ))
+        _submit(
+            sync_planet_resources_with_payload(
+                user_id, username, galaxy, system, position, planet_name,
+                metal, crystal, deuterium, metal_rate, crystal_rate, deuterium_rate, last_update
+            ),
+            op="sync_planet_resources_with_payload",
+        )
     except Exception as exc:  # pragma: no cover
         logger.debug("sync_planet_resources_payload wrapper failed: %s", exc)
 
 
 async def upsert_building_level_with_payload(user_id: int, username: str, galaxy: int, system: int, position: int,
                                              planet_name: str, building_type: str, level: int) -> None:
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return
     try:
         async with SessionLocal() as session:
-            planet = await _ensure_user_and_planet(user_id, username, galaxy, system, position, planet_name)
+            planet = await _ensure_user_and_planet_in_session(session, user_id, username, galaxy, system, position, planet_name)
             if planet is None:
                 return
             result = await session.execute(
@@ -354,15 +444,73 @@ async def upsert_building_level_with_payload(user_id: int, username: str, galaxy
 
 def sync_building_level_payload(user_id: int, username: str, galaxy: int, system: int, position: int,
                                 planet_name: str, building_type: str, level: int) -> None:
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return
     try:
-        asyncio.run(upsert_building_level_with_payload(user_id, username, galaxy, system, position, planet_name, building_type, level))
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        loop.create_task(upsert_building_level_with_payload(user_id, username, galaxy, system, position, planet_name, building_type, level))
+        _submit(
+            upsert_building_level_with_payload(user_id, username, galaxy, system, position, planet_name, building_type, level),
+            op="upsert_building_level_with_payload",
+        )
     except Exception as exc:  # pragma: no cover
         logger.debug("sync_building_level_payload wrapper failed: %s", exc)
+
+
+# -----------------
+# Fleet persistence helpers
+# -----------------
+async def _upsert_fleet_by_entity(world, ent) -> None:
+    if not _db_available():
+        return
+    try:
+        from src.models import Player as _P, Position as _Pos, Planet as _Pl, Fleet as _Fl
+        player = world.component_for_entity(ent, _P)
+        pos = world.component_for_entity(ent, _Pos)
+        pmeta = world.component_for_entity(ent, _Pl)
+        fleet = world.component_for_entity(ent, _Fl)
+    except Exception as exc:
+        logger.debug("upsert_fleet_by_entity: missing components for ent %s: %s", ent, exc)
+        return
+
+    try:
+        async with SessionLocal() as session:
+            planet = await _ensure_user_and_planet_in_session(
+                session,
+                int(player.user_id), getattr(player, 'name', f"User{player.user_id}"), int(pos.galaxy), int(pos.system), int(pos.planet), getattr(pmeta, 'name', 'Homeworld')
+            )
+            if planet is None:
+                return
+            # Get or create Fleet row
+            result = await session.execute(select(ORMFleet).where(ORMFleet.planet_id == planet.id))
+            orm_fleet = result.scalar_one_or_none()
+            values = {
+                'light_fighter': int(getattr(fleet, 'light_fighter', 0) or 0),
+                'heavy_fighter': int(getattr(fleet, 'heavy_fighter', 0) or 0),
+                'cruiser': int(getattr(fleet, 'cruiser', 0) or 0),
+                'battleship': int(getattr(fleet, 'battleship', 0) or 0),
+                'bomber': int(getattr(fleet, 'bomber', 0) or 0),
+                'colony_ship': int(getattr(fleet, 'colony_ship', 0) or 0),
+            }
+            if orm_fleet is None:
+                orm_fleet = ORMFleet(planet_id=planet.id, **values)
+                session.add(orm_fleet)
+            else:
+                for k, v in values.items():
+                    setattr(orm_fleet, k, v)
+            await session.commit()
+    except SQLAlchemyError as exc:  # pragma: no cover
+        logger.debug("upsert_fleet failed (transient): %s", exc)
+    except Exception:
+        # Defensive; do not break gameplay if components missing
+        pass
+
+
+def upsert_fleet(world, ent) -> None:
+    if not _db_available():
+        return
+    try:
+        _submit(_upsert_fleet_by_entity(world, ent), op="upsert_fleet_by_entity")
+    except Exception as exc:
+        logger.debug("upsert_fleet wrapper failed: %s", exc)
 
 
 # -----------------
@@ -373,7 +521,7 @@ async def _load_player_planet_into_world(world, user_id: int, planet_id: int) ->
 
     Returns True on success, False if DB unavailable or validation fails.
     """
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return False
     try:
         from src.models import Player as PlayerComp, Position, Resources, ResourceProduction, Buildings, BuildQueue, ShipBuildQueue as ShipBuildQueueComp, Fleet as FleetComp, Research as ResearchComp, ResearchQueue as ResearchQueueComp, Planet as PlanetComp
@@ -460,7 +608,7 @@ async def _load_player_planet_into_world(world, user_id: int, planet_id: int) ->
 
 async def _load_player_into_world(world, user_id: int) -> None:
     """Load a player's state from DB into ECS world, creating or updating the entity."""
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return
     try:
         from src.models import Player as PlayerComp, Position, Resources, ResourceProduction, Buildings, BuildQueue, ShipBuildQueue as ShipBuildQueueComp, Fleet as FleetComp, Research as ResearchComp, ResearchQueue as ResearchQueueComp, Planet as PlanetComp
@@ -549,13 +697,10 @@ async def _load_player_into_world(world, user_id: int) -> None:
 
 
 def load_player_into_world(world, user_id: int) -> None:
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return
     try:
-        asyncio.run(_load_player_into_world(world, user_id))
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        loop.create_task(_load_player_into_world(world, user_id))
+        _submit(_load_player_into_world(world, user_id), op="load_player_into_world")
     except Exception as exc:
         logger.debug("load_player_into_world wrapper failed: %s", exc)
 
@@ -563,24 +708,21 @@ def load_player_into_world(world, user_id: int) -> None:
 def load_player_planet_into_world(world, user_id: int, planet_id: int) -> bool:
     """Synchronous wrapper to load a specific planet for a user into ECS.
 
-    Returns True if the planet was loaded, False otherwise (e.g., DB disabled, validation failed).
+    Submits to the persistence loop and waits briefly for completion.
+    Returns True on success, False on timeout or errors.
     """
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return False
     try:
-        return asyncio.run(_load_player_planet_into_world(world, user_id, planet_id))
-    except RuntimeError:
-        # Inside running loop; schedule and assume success for responsiveness
-        loop = asyncio.get_event_loop()
-        loop.create_task(_load_player_planet_into_world(world, user_id, planet_id))
-        return True
+        result = _submit_and_wait(_load_player_planet_into_world(world, user_id, planet_id), timeout=2.0, default=False, op="load_player_planet_into_world")
+        return bool(result)
     except Exception as exc:  # pragma: no cover
         logger.debug("load_player_planet_into_world wrapper failed: %s", exc)
         return False
 
 
 async def _load_all_players_into_world(world) -> None:
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return
     try:
         async with SessionLocal() as session:
@@ -593,20 +735,17 @@ async def _load_all_players_into_world(world) -> None:
 
 
 def load_all_players_into_world(world) -> None:
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return
     try:
-        asyncio.run(_load_all_players_into_world(world))
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        loop.create_task(_load_all_players_into_world(world))
+        _submit(_load_all_players_into_world(world), op="load_all_players_into_world")
     except Exception as exc:
         logger.debug("load_all_players_into_world wrapper failed: %s", exc)
 
 
 # Atomic resource spend
 async def _spend_resources_atomic_by_entity(world, ent, cost: Dict[str, int]) -> None:
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return
     try:
         from src.models import Player, Position, Planet as PlanetComp
@@ -630,20 +769,333 @@ async def _spend_resources_atomic_by_entity(world, ent, cost: Dict[str, int]) ->
 
 
 def spend_resources_atomic(world, ent, cost: Dict[str, int]) -> None:
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return
     try:
-        asyncio.run(_spend_resources_atomic_by_entity(world, ent, cost))
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        loop.create_task(_spend_resources_atomic_by_entity(world, ent, cost))
+        _submit(_spend_resources_atomic_by_entity(world, ent, cost), op="spend_resources_atomic_by_entity")
     except Exception as exc:
         logger.debug("spend_resources_atomic wrapper failed: %s", exc)
 
 
+# Ship Build Queue persistence helpers
+async def _enqueue_ship_build_by_entity(world, ent, ship_type: str, count: int, completion_time) -> None:
+    if not _db_available():
+        return
+    try:
+        from datetime import datetime as _dt
+        from src.models import Player, Position, Planet as PlanetComp
+        player = world.component_for_entity(ent, Player)
+        pos = world.component_for_entity(ent, Position)
+        pmeta = world.component_for_entity(ent, PlanetComp)
+        async with SessionLocal() as session:
+            planet = await _ensure_user_and_planet(player.user_id, player.name, pos.galaxy, pos.system, pos.planet, pmeta.name)
+            if planet is None:
+                return
+            # Re-fetch within session to guarantee attached instance
+            result = await session.execute(select(ORMPlanet).where(ORMPlanet.id == planet.id))
+            planet = result.scalar_one()
+            item = ORMSBQ(
+                planet_id=planet.id,
+                ship_type=str(ship_type),
+                count=int(count),
+                completion_time=ensure_aware_utc(parse_utc(completion_time)) if completion_time is not None else utc_now(),
+            )
+            session.add(item)
+            await session.commit()
+            try:
+                logger.info(
+                    "ship_build_enqueued",
+                    extra={
+                        "action_type": "ship_build_enqueued",
+                        "planet_id": int(getattr(planet, "id", 0) or 0),
+                        "ship_type": str(getattr(item, "ship_type", "")),
+                        "count": int(getattr(item, "count", 0) or 0),
+                        "completion_time": ensure_aware_utc(getattr(item, "completion_time", utc_now())).isoformat(),
+                    },
+                )
+            except Exception:
+                pass
+    except SQLAlchemyError as exc:  # pragma: no cover
+        logger.warning("enqueue_ship_build failed: %s", exc)
+    except Exception:
+        # Defensive: do not break gameplay if components missing
+        pass
+
+
+def enqueue_ship_build(world, ent, ship_type: str, count: int, completion_time) -> None:
+    if not _db_available():
+        return
+    try:
+        _submit(_enqueue_ship_build_by_entity(world, ent, ship_type, count, completion_time), op="enqueue_ship_build_by_entity")
+    except Exception as exc:
+        logger.debug("enqueue_ship_build wrapper failed: %s", exc)
+
+
+async def _load_ship_queue_items_by_entity(world, ent) -> List[Dict]:
+    if not _db_available():
+        return []
+    try:
+        from src.models import Player, Position, Planet as PlanetComp
+        player = world.component_for_entity(ent, Player)
+        pos = world.component_for_entity(ent, Position)
+        pmeta = world.component_for_entity(ent, PlanetComp)
+        async with SessionLocal() as session:
+            planet = await _ensure_user_and_planet(player.user_id, player.name, pos.galaxy, pos.system, pos.planet, pmeta.name)
+            if planet is None:
+                return []
+            result = await session.execute(select(ORMSBQ).where((ORMSBQ.planet_id == planet.id) & (ORMSBQ.completed_at == None)).order_by(ORMSBQ.id.asc()))
+            rows = result.scalars().all()
+            items: List[Dict] = []
+            for r in rows:
+                items.append({
+                    'type': getattr(r, 'ship_type'),
+                    'count': int(getattr(r, 'count', 1)),
+                    'completion_time': ensure_aware_utc(getattr(r, 'completion_time')),
+                })
+            return items
+    except SQLAlchemyError as exc:  # pragma: no cover
+        logger.warning("load_ship_queue_items failed: %s", exc)
+        return []
+    except Exception:
+        return []
+
+
+def load_ship_queue_items(world, ent) -> List[Dict]:
+    if not _db_available():
+        return []
+    try:
+        return _submit_and_wait(_load_ship_queue_items_by_entity(world, ent), timeout=2.0, default=[], op="load_ship_queue_items")
+    except Exception as exc:
+        logger.debug("load_ship_queue_items wrapper failed: %s", exc)
+        return []
+
+
+async def _complete_next_ship_build_by_entity(world, ent) -> None:
+    if not _db_available():
+        return
+    try:
+        from datetime import datetime as _dt
+        from sqlalchemy import update
+        from src.models import Player, Position, Planet as PlanetComp
+        player = world.component_for_entity(ent, Player)
+        pos = world.component_for_entity(ent, Position)
+        pmeta = world.component_for_entity(ent, PlanetComp)
+        async with SessionLocal() as session:
+            planet = await _ensure_user_and_planet(player.user_id, player.name, pos.galaxy, pos.system, pos.planet, pmeta.name)
+            if planet is None:
+                return
+            # Select earliest uncompleted item
+            result = await session.execute(
+                select(ORMSBQ).where((ORMSBQ.planet_id == planet.id) & (ORMSBQ.completed_at == None)).order_by(ORMSBQ.id.asc()).limit(1)
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return
+            await session.execute(
+                update(ORMSBQ).where(ORMSBQ.id == row.id).values(completed_at=utc_now())
+            )
+            await session.commit()
+            try:
+                logger.info(
+                    "ship_build_completed",
+                    extra={
+                        "action_type": "ship_build_completed",
+                        "queue_item_id": int(getattr(row, "id", 0) or 0),
+                        "planet_id": int(getattr(planet, "id", 0) or 0),
+                        "ship_type": str(getattr(row, "ship_type", "")),
+                        "count": int(getattr(row, "count", 0) or 0),
+                    },
+                )
+            except Exception:
+                pass
+    except SQLAlchemyError as exc:  # pragma: no cover
+        logger.warning("complete_next_ship_build failed: %s", exc)
+
+
+def complete_next_ship_build(world, ent) -> None:
+    if not _db_available():
+        return
+    try:
+        _submit(_complete_next_ship_build_by_entity(world, ent), op="complete_next_ship_build_by_entity")
+    except Exception as exc:
+        logger.debug("complete_next_ship_build wrapper failed: %s", exc)
+
+
+async def _finalize_overdue_ship_builds_by_entity(world, ent) -> None:
+    if not _db_available():
+        return
+    try:
+        from datetime import datetime as _dt
+        from sqlalchemy import update
+        from src.models import Player, Position, Planet as PlanetComp, Fleet as FleetComp
+        player = world.component_for_entity(ent, Player)
+        pos = world.component_for_entity(ent, Position)
+        pmeta = world.component_for_entity(ent, PlanetComp)
+        fleet = world.component_for_entity(ent, FleetComp)
+        async with SessionLocal() as session:
+            planet = await _ensure_user_and_planet(player.user_id, player.name, pos.galaxy, pos.system, pos.planet, pmeta.name)
+            if planet is None:
+                return
+            now = utc_now()
+            result = await session.execute(
+                select(ORMSBQ).where((ORMSBQ.planet_id == planet.id) & (ORMSBQ.completed_at == None) & (ORMSBQ.completion_time <= now)).order_by(ORMSBQ.id.asc())
+            )
+            rows = result.scalars().all()
+            for row in rows:
+                # Apply to ECS fleet
+                st = getattr(row, 'ship_type')
+                cnt = int(getattr(row, 'count', 1))
+                if st and hasattr(fleet, st):
+                    try:
+                        cur = int(getattr(fleet, st))
+                        setattr(fleet, st, cur + max(0, cnt))
+                    except Exception:
+                        pass
+                # Mark as completed in DB
+                await session.execute(update(ORMSBQ).where(ORMSBQ.id == row.id).values(completed_at=now))
+            if rows:
+                await session.commit()
+                try:
+                    logger.info(
+                        "ship_builds_finalized",
+                        extra={
+                            "action_type": "ship_builds_finalized",
+                            "planet_id": int(getattr(planet, "id", 0) or 0),
+                            "finalized_count": int(len(rows)),
+                        },
+                    )
+                except Exception:
+                    pass
+                # Persist updated fleet counts reflecting finalized ship builds
+                try:
+                    await _upsert_fleet_by_entity(world, ent)
+                except Exception:
+                    pass
+    except SQLAlchemyError as exc:  # pragma: no cover
+        logger.warning("finalize_overdue_ship_builds failed: %s", exc)
+
+
+def finalize_overdue_ship_builds(world, ent) -> None:
+    if not _db_available():
+        return
+    try:
+        _submit(_finalize_overdue_ship_builds_by_entity(world, ent), op="finalize_overdue_ship_builds_by_entity")
+    except Exception as exc:
+        logger.debug("finalize_overdue_ship_builds wrapper failed: %s", exc)
+
+
+# Fleet mission persistence helpers
+async def _upsert_fleet_mission_by_entity(world, ent, movement) -> None:
+    if not _db_available():
+        return
+    try:
+        from src.models import Player as _P
+        player = world.component_for_entity(ent, _P)
+        async with SessionLocal() as session:
+            # Check for existing mission for this user (one active mission per user in current model)
+            result = await session.execute(select(ORMFleetMission).where(ORMFleetMission.user_id == int(player.user_id)))
+            row = result.scalar_one_or_none()
+            values = {
+                'user_id': int(player.user_id),
+                'origin_galaxy': int(getattr(movement.origin, 'galaxy', 1)),
+                'origin_system': int(getattr(movement.origin, 'system', 1)),
+                'origin_planet': int(getattr(movement.origin, 'planet', 1)),
+                'target_galaxy': int(getattr(movement.target, 'galaxy', 1)),
+                'target_system': int(getattr(movement.target, 'system', 1)),
+                'target_planet': int(getattr(movement.target, 'planet', 1)),
+                'mission': str(getattr(movement, 'mission', 'transfer')),
+                'speed': float(getattr(movement, 'speed', 1.0) or 1.0),
+                'recalled': bool(getattr(movement, 'recalled', False)),
+                'departure_time': ensure_aware_utc(getattr(movement, 'departure_time')),
+                'arrival_time': ensure_aware_utc(getattr(movement, 'arrival_time')),
+            }
+            if row is None:
+                row = ORMFleetMission(**values)
+                session.add(row)
+            else:
+                for k, v in values.items():
+                    setattr(row, k, v)
+            await session.commit()
+    except SQLAlchemyError as exc:  # pragma: no cover
+        logger.warning("upsert_fleet_mission failed: %s", exc)
+    except Exception:
+        # Defensive; do not break gameplay if components missing
+        pass
+
+
+def upsert_fleet_mission(world, ent, movement) -> None:
+    if not _db_available():
+        return
+    try:
+        _submit(_upsert_fleet_mission_by_entity(world, ent, movement), op="upsert_fleet_mission_by_entity")
+    except Exception as exc:
+        logger.debug("upsert_fleet_mission wrapper failed: %s", exc)
+
+
+async def _load_fleet_mission_by_entity(world, ent):
+    if not _db_available():
+        return None
+    try:
+        from src.models import Player as _P
+        player = world.component_for_entity(ent, _P)
+        async with SessionLocal() as session:
+            result = await session.execute(select(ORMFleetMission).where(ORMFleetMission.user_id == int(player.user_id)))
+            row = result.scalar_one_or_none()
+            if row is None:
+                return None
+            return {
+                'origin': {'galaxy': int(row.origin_galaxy), 'system': int(row.origin_system), 'planet': int(row.origin_planet)},
+                'target': {'galaxy': int(row.target_galaxy), 'system': int(row.target_system), 'planet': int(row.target_planet)},
+                'mission': getattr(row, 'mission'),
+                'speed': float(getattr(row, 'speed', 1.0) or 1.0),
+                'recalled': bool(getattr(row, 'recalled', False)),
+                'departure_time': ensure_aware_utc(getattr(row, 'departure_time')),
+                'arrival_time': ensure_aware_utc(getattr(row, 'arrival_time')),
+            }
+    except SQLAlchemyError as exc:  # pragma: no cover
+        logger.warning("load_fleet_mission failed: %s", exc)
+        return None
+    except Exception:
+        return None
+
+
+def load_fleet_mission(world, ent):
+    if not _db_available():
+        return None
+    try:
+        return _submit_and_wait(_load_fleet_mission_by_entity(world, ent), timeout=2.0, default=None, op="load_fleet_mission")
+    except Exception as exc:
+        logger.debug("load_fleet_mission wrapper failed: %s", exc)
+        return None
+
+
+async def _delete_fleet_mission_by_entity(world, ent) -> None:
+    if not _db_available():
+        return
+    try:
+        from src.models import Player as _P
+        player = world.component_for_entity(ent, _P)
+        async with SessionLocal() as session:
+            await session.execute(delete(ORMFleetMission).where(ORMFleetMission.user_id == int(player.user_id)))
+            await session.commit()
+    except SQLAlchemyError as exc:  # pragma: no cover
+        logger.warning("delete_fleet_mission failed: %s", exc)
+    except Exception:
+        pass
+
+
+def delete_fleet_mission(world, ent) -> None:
+    if not _db_available():
+        return
+    try:
+        _submit(_delete_fleet_mission_by_entity(world, ent), op="delete_fleet_mission_by_entity")
+    except Exception as exc:
+        logger.debug("delete_fleet_mission wrapper failed: %s", exc)
+
+
 # Cleanup inactive users
 async def _cleanup_inactive_players(days: int = 30) -> int:
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return 0
     try:
         from datetime import datetime, timedelta
@@ -661,14 +1113,516 @@ async def _cleanup_inactive_players(days: int = 30) -> int:
 
 
 def cleanup_inactive_players(days: int = 30) -> int:
-    if not _DB_AVAILABLE:
+    if not _db_available():
         return 0
     try:
-        return asyncio.run(_cleanup_inactive_players(days))
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        task = loop.create_task(_cleanup_inactive_players(days))
-        return 0
+        res = _submit_and_wait(_cleanup_inactive_players(days), timeout=2.0, default=0, op="cleanup_inactive_players")
+        return int(res or 0)
     except Exception as exc:
         logger.debug("cleanup_inactive_players wrapper failed: %s", exc)
         return 0
+
+
+# -----------------
+# Battle Reports helpers
+# -----------------
+async def fetch_battle_reports_for_user(user_id: int, limit: int = 50, offset: int = 0) -> List[dict]:
+    """Async: List battle reports visible to a user (attacker or defender), newest-first.
+
+    Returns empty list if DB unavailable.
+    """
+    if not _db_available():
+        return []
+    try:
+        async with SessionLocal() as session:  # type: ignore[misc]
+            from sqlalchemy import select, or_  # local import to avoid widening globals
+            stmt = (
+                select(ORMBattleReport)
+                .where(
+                    (ORMBattleReport.attacker_user_id == int(user_id))
+                    | (ORMBattleReport.defender_user_id == int(user_id))
+                )
+                .order_by(ORMBattleReport.created_at.desc())
+                .offset(int(offset))
+                .limit(int(limit))
+            )
+            result = await session.execute(stmt)
+            rows = result.scalars().all()
+            return [
+                {
+                    "id": int(r.id),
+                    "attacker_user_id": int(r.attacker_user_id) if r.attacker_user_id is not None else None,
+                    "defender_user_id": int(r.defender_user_id) if r.defender_user_id is not None else None,
+                    "location": r.location,
+                    "outcome": r.outcome,
+                    "created_at": r.created_at.isoformat() if getattr(r, "created_at", None) else None,
+                }
+                for r in rows
+            ]
+    except Exception as exc:  # pragma: no cover - resilience path
+        logger.warning("fetch_battle_reports_for_user failed: %s", exc)
+        return []
+
+
+async def fetch_battle_report_for_user(user_id: int, report_id: int) -> Optional[dict]:
+    """Async: Retrieve a single battle report if the user is a participant; else None.
+
+    Returns None if DB unavailable.
+    """
+    if not _db_available():
+        return None
+    try:
+        async with SessionLocal() as session:  # type: ignore[misc]
+            from sqlalchemy import select
+            result = await session.execute(select(ORMBattleReport).where(ORMBattleReport.id == int(report_id)))
+            r = result.scalar_one_or_none()
+            if r is not None and (
+                int(r.attacker_user_id or -1) == int(user_id) or int(r.defender_user_id or -1) == int(user_id)
+            ):
+                return {
+                    "id": int(r.id),
+                    "attacker_user_id": int(r.attacker_user_id) if r.attacker_user_id is not None else None,
+                    "defender_user_id": int(r.defender_user_id) if r.defender_user_id is not None else None,
+                    "location": r.location,
+                    "outcome": r.outcome,
+                    "created_at": r.created_at.isoformat() if getattr(r, "created_at", None) else None,
+                }
+            return None
+    except Exception as exc:  # pragma: no cover - resilience path
+        logger.warning("fetch_battle_report_for_user failed: %s", exc)
+        return None
+
+
+async def _create_battle_report(payload: dict) -> Optional[tuple[int, str]]:
+    """Async: Insert a new battle report. Returns (id, created_at_iso) on success, else None."""
+    if not _db_available():
+        return None
+    try:
+        async with SessionLocal() as session:  # type: ignore[misc]
+            row = ORMBattleReport(
+                attacker_user_id=(int(payload.get("attacker_user_id")) if payload.get("attacker_user_id") is not None else None),
+                defender_user_id=(int(payload.get("defender_user_id")) if payload.get("defender_user_id") is not None else None),
+                location=payload.get("location") or {},
+                outcome=payload.get("outcome") or {},
+            )
+            session.add(row)
+            await session.flush()
+            await session.commit()
+            created_iso = row.created_at.isoformat() if getattr(row, "created_at", None) else utc_now().isoformat()
+            try:
+                logger.info(
+                    "battle_report_created",
+                    extra={
+                        "action_type": "battle_report_created",
+                        "report_id": int(getattr(row, "id", 0) or 0),
+                        "attacker_user_id": int(getattr(row, "attacker_user_id", 0) or 0) if getattr(row, "attacker_user_id", None) is not None else None,
+                        "defender_user_id": int(getattr(row, "defender_user_id", 0) or 0) if getattr(row, "defender_user_id", None) is not None else None,
+                        "timestamp": created_iso,
+                    },
+                )
+            except Exception:
+                pass
+            metrics.increment_event("db.battle_report_created")
+            return int(row.id), created_iso
+    except Exception as exc:  # pragma: no cover - resilience path
+        logger.warning("_create_battle_report failed: %s", exc)
+        return None
+
+
+def create_battle_report(payload: dict) -> Optional[tuple[int, str]]:
+    """Sync wrapper for _create_battle_report used from the game loop thread.
+
+    Fire-and-forget: schedule on the captured persistence loop and return None. If loop missing, no-op.
+    """
+    try:
+        _submit(_create_battle_report(payload), op="create_battle_report")
+        return None
+    except Exception as exc:  # pragma: no cover
+        logger.debug("create_battle_report wrapper failed: %s", exc)
+        return None
+
+
+# -----------------
+# Espionage Reports helpers
+# -----------------
+async def fetch_espionage_reports_for_user(user_id: int, limit: int = 50, offset: int = 0) -> List[dict]:
+    """Async: List espionage reports visible to a user (attacker or defender), newest-first.
+
+    Returns empty list if DB unavailable.
+    """
+    if not _db_available():
+        return []
+    try:
+        async with SessionLocal() as session:  # type: ignore[misc]
+            from sqlalchemy import select
+            stmt = (
+                select(ORMEspionageReport)
+                .where(
+                    (ORMEspionageReport.attacker_user_id == int(user_id))
+                    | (ORMEspionageReport.defender_user_id == int(user_id))
+                )
+                .order_by(ORMEspionageReport.created_at.desc())
+                .offset(int(offset))
+                .limit(int(limit))
+            )
+            result = await session.execute(stmt)
+            rows = result.scalars().all()
+            return [
+                {
+                    "id": int(r.id),
+                    "attacker_user_id": int(r.attacker_user_id) if r.attacker_user_id is not None else None,
+                    "defender_user_id": int(r.defender_user_id) if r.defender_user_id is not None else None,
+                    "location": r.location,
+                    "snapshot": r.snapshot,
+                    "created_at": r.created_at.isoformat() if getattr(r, "created_at", None) else None,
+                }
+                for r in rows
+            ]
+    except Exception as exc:  # pragma: no cover - resilience path
+        logger.warning("fetch_espionage_reports_for_user failed: %s", exc)
+        return []
+
+
+async def fetch_espionage_report_for_user(user_id: int, report_id: int) -> Optional[dict]:
+    """Async: Retrieve a single espionage report if the user is a participant; else None.
+
+    Returns None if DB unavailable.
+    """
+    if not _db_available():
+        return None
+    try:
+        async with SessionLocal() as session:  # type: ignore[misc]
+            from sqlalchemy import select
+            result = await session.execute(select(ORMEspionageReport).where(ORMEspionageReport.id == int(report_id)))
+            r = result.scalar_one_or_none()
+            if r is not None and (
+                int(r.attacker_user_id or -1) == int(user_id) or int(r.defender_user_id or -1) == int(user_id)
+            ):
+                return {
+                    "id": int(r.id),
+                    "attacker_user_id": int(r.attacker_user_id) if r.attacker_user_id is not None else None,
+                    "defender_user_id": int(r.defender_user_id) if r.defender_user_id is not None else None,
+                    "location": r.location,
+                    "snapshot": r.snapshot,
+                    "created_at": r.created_at.isoformat() if getattr(r, "created_at", None) else None,
+                }
+            return None
+    except Exception as exc:  # pragma: no cover - resilience path
+        logger.warning("fetch_espionage_report_for_user failed: %s", exc)
+        return None
+
+
+async def _create_espionage_report(payload: dict) -> Optional[tuple[int, str]]:
+    """Async: Insert a new espionage report. Returns (id, created_at_iso) on success, else None."""
+    if not _db_available():
+        return None
+    try:
+        async with SessionLocal() as session:  # type: ignore[misc]
+            row = ORMEspionageReport(
+                attacker_user_id=(int(payload.get("attacker_user_id")) if payload.get("attacker_user_id") is not None else None),
+                defender_user_id=(int(payload.get("defender_user_id")) if payload.get("defender_user_id") is not None else None),
+                location=payload.get("location") or {},
+                snapshot=payload.get("snapshot") or {},
+            )
+            session.add(row)
+            await session.flush()
+            await session.commit()
+            created_iso = row.created_at.isoformat() if getattr(row, "created_at", None) else utc_now().isoformat()
+            try:
+                logger.info(
+                    "espionage_report_created",
+                    extra={
+                        "action_type": "espionage_report_created",
+                        "report_id": int(getattr(row, "id", 0) or 0),
+                        "attacker_user_id": int(getattr(row, "attacker_user_id", 0) or 0) if getattr(row, "attacker_user_id", None) is not None else None,
+                        "defender_user_id": int(getattr(row, "defender_user_id", 0) or 0) if getattr(row, "defender_user_id", None) is not None else None,
+                        "timestamp": created_iso,
+                    },
+                )
+            except Exception:
+                pass
+            metrics.increment_event("db.espionage_report_created")
+            return int(row.id), created_iso
+    except Exception as exc:  # pragma: no cover - resilience path
+        logger.warning("_create_espionage_report failed: %s", exc)
+        return None
+
+
+def create_espionage_report(payload: dict) -> Optional[tuple[int, str]]:
+    """Sync wrapper for _create_espionage_report used from the game loop thread.
+
+    Fire-and-forget via persistence loop.
+    """
+    try:
+        _submit(_create_espionage_report(payload), op="create_espionage_report")
+        return None
+    except Exception as exc:  # pragma: no cover
+        logger.debug("create_espionage_report wrapper failed: %s", exc)
+        return None
+
+
+# Building Queue persistence helpers
+async def _enqueue_build_queue_by_entity(world, ent, building_type: str, level: int, completion_time) -> None:
+    if not _db_available():
+        return
+    try:
+        from src.models import Player, Position, Planet as PlanetComp
+        player = world.component_for_entity(ent, Player)
+        pos = world.component_for_entity(ent, Position)
+        pmeta = world.component_for_entity(ent, PlanetComp)
+        async with SessionLocal() as session:
+            planet = await _ensure_user_and_planet(player.user_id, player.name, pos.galaxy, pos.system, pos.planet, pmeta.name)
+            if planet is None:
+                return
+            result = await session.execute(select(ORMPlanet).where(ORMPlanet.id == planet.id))
+            planet = result.scalar_one()
+            item = ORMBQI(
+                planet_id=planet.id,
+                building_type=str(building_type),
+                level=int(level),
+                enqueued_at=utc_now(),
+                complete_at=ensure_aware_utc(parse_utc(completion_time)) if completion_time is not None else utc_now(),
+                status="pending",
+            )
+            session.add(item)
+            await session.commit()
+            try:
+                logger.info(
+                    "build_queue_enqueued",
+                    extra={
+                        "action_type": "build_queue_enqueued",
+                        "planet_id": int(getattr(planet, "id", 0) or 0),
+                        "building_type": str(getattr(item, "building_type", "")),
+                        "level": int(getattr(item, "level", 0) or 0),
+                        "complete_at": ensure_aware_utc(getattr(item, "complete_at", utc_now())).isoformat(),
+                    },
+                )
+            except Exception:
+                pass
+            metrics.increment_event("db.build_queue_enqueued")
+    except SQLAlchemyError as exc:  # pragma: no cover
+        logger.warning("enqueue_build_queue failed: %s", exc)
+    except Exception:
+        pass
+
+
+def enqueue_build_queue(world, ent, building_type: str, level: int, completion_time) -> None:
+    if not _db_available():
+        return
+    try:
+        _submit(_enqueue_build_queue_by_entity(world, ent, building_type, level, completion_time), op="enqueue_build_queue_by_entity")
+    except Exception as exc:
+        logger.debug("enqueue_build_queue wrapper failed: %s", exc)
+
+
+async def _load_build_queue_items_by_entity(world, ent) -> List[Dict]:
+    if not _db_available():
+        return []
+    try:
+        from src.models import Player, Position, Planet as PlanetComp
+        player = world.component_for_entity(ent, Player)
+        pos = world.component_for_entity(ent, Position)
+        pmeta = world.component_for_entity(ent, PlanetComp)
+        async with SessionLocal() as session:
+            planet = await _ensure_user_and_planet(player.user_id, player.name, pos.galaxy, pos.system, pos.planet, pmeta.name)
+            if planet is None:
+                return []
+            result = await session.execute(
+                select(ORMBQI).where((ORMBQI.planet_id == planet.id) & (ORMBQI.status == "pending")).order_by(ORMBQI.id.asc())
+            )
+            rows = result.scalars().all()
+            items: List[Dict] = []
+            for r in rows:
+                items.append({
+                    'type': getattr(r, 'building_type'),
+                    'completion_time': ensure_aware_utc(getattr(r, 'complete_at')),
+                })
+            return items
+    except SQLAlchemyError as exc:  # pragma: no cover
+        logger.warning("load_build_queue_items failed: %s", exc)
+        return []
+    except Exception:
+        return []
+
+
+def load_build_queue_items(world, ent) -> List[Dict]:
+    if not _db_available():
+        return []
+    try:
+        res = _submit_and_wait(_load_build_queue_items_by_entity(world, ent), timeout=2.0, default=[], op="load_build_queue_items_by_entity")
+        return list(res or [])
+    except Exception as exc:
+        logger.debug("load_build_queue_items wrapper failed: %s", exc)
+        return []
+
+
+async def _complete_next_build_queue_by_entity(world, ent) -> None:
+    if not _db_available():
+        return
+    try:
+        from src.models import Player, Position, Planet as PlanetComp
+        player = world.component_for_entity(ent, Player)
+        pos = world.component_for_entity(ent, Position)
+        pmeta = world.component_for_entity(ent, PlanetComp)
+        async with SessionLocal() as session:
+            planet = await _ensure_user_and_planet(player.user_id, player.name, pos.galaxy, pos.system, pos.planet, pmeta.name)
+            if planet is None:
+                return
+            result = await session.execute(
+                select(ORMBQI).where((ORMBQI.planet_id == planet.id) & (ORMBQI.status == "pending")).order_by(ORMBQI.id.asc()).limit(1)
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return
+            await session.execute(update(ORMBQI).where(ORMBQI.id == row.id).values(status="completed"))
+            await session.commit()
+            try:
+                logger.info(
+                    "build_queue_completed",
+                    extra={
+                        "action_type": "build_queue_completed",
+                        "queue_item_id": int(getattr(row, "id", 0) or 0),
+                        "planet_id": int(getattr(planet, "id", 0) or 0),
+                        "building_type": str(getattr(row, "building_type", "")),
+                        "level": int(getattr(row, "level", 0) or 0),
+                    },
+                )
+            except Exception:
+                pass
+            metrics.increment_event("db.build_queue_completed")
+    except SQLAlchemyError as exc:  # pragma: no cover
+        logger.warning("complete_next_build_queue failed: %s", exc)
+
+
+def complete_next_build_queue(world, ent) -> None:
+    if not _db_available():
+        return
+    try:
+        _submit(_complete_next_build_queue_by_entity(world, ent), op="complete_next_build_queue_by_entity")
+    except Exception as exc:
+        logger.debug("complete_next_build_queue wrapper failed: %s", exc)
+
+
+# Research Queue persistence helpers
+async def _enqueue_research_by_entity(world, ent, research_type: str, level: int, completion_time) -> None:
+    if not _db_available():
+        return
+    try:
+        from src.models import Player
+        player = world.component_for_entity(ent, Player)
+        async with SessionLocal() as session:
+            item = ORMRQI(
+                user_id=int(player.user_id),
+                research_type=str(research_type),
+                level=int(level),
+                enqueued_at=utc_now(),
+                complete_at=ensure_aware_utc(parse_utc(completion_time)) if completion_time is not None else utc_now(),
+                status="pending",
+            )
+            session.add(item)
+            await session.commit()
+            try:
+                logger.info(
+                    "research_enqueued",
+                    extra={
+                        "action_type": "research_enqueued",
+                        "user_id": int(getattr(item, "user_id", 0) or 0),
+                        "research_type": str(getattr(item, "research_type", "")),
+                        "level": int(getattr(item, "level", 0) or 0),
+                        "complete_at": ensure_aware_utc(getattr(item, "complete_at", utc_now())).isoformat(),
+                    },
+                )
+            except Exception:
+                pass
+            metrics.increment_event("db.research_enqueued")
+    except SQLAlchemyError as exc:  # pragma: no cover
+        logger.warning("enqueue_research failed: %s", exc)
+    except Exception:
+        pass
+
+
+def enqueue_research(world, ent, research_type: str, level: int, completion_time) -> None:
+    if not _db_available():
+        return
+    try:
+        _submit(_enqueue_research_by_entity(world, ent, research_type, level, completion_time), op="enqueue_research_by_entity")
+    except Exception as exc:
+        logger.debug("enqueue_research wrapper failed: %s", exc)
+
+
+async def _load_research_queue_items_by_entity(world, ent) -> List[Dict]:
+    if not _db_available():
+        return []
+    try:
+        from src.models import Player
+        player = world.component_for_entity(ent, Player)
+        async with SessionLocal() as session:
+            result = await session.execute(
+                select(ORMRQI).where((ORMRQI.user_id == int(player.user_id)) & (ORMRQI.status == "pending")).order_by(ORMRQI.id.asc())
+            )
+            rows = result.scalars().all()
+            items: List[Dict] = []
+            for r in rows:
+                items.append({
+                    'type': getattr(r, 'research_type'),
+                    'completion_time': ensure_aware_utc(getattr(r, 'complete_at')),
+                })
+            return items
+    except SQLAlchemyError as exc:  # pragma: no cover
+        logger.warning("load_research_queue_items failed: %s", exc)
+        return []
+    except Exception:
+        return []
+
+
+def load_research_queue_items(world, ent) -> List[Dict]:
+    if not _db_available():
+        return []
+    try:
+        res = _submit_and_wait(_load_research_queue_items_by_entity(world, ent), timeout=2.0, default=[], op="load_research_queue_items_by_entity")
+        return list(res or [])
+    except Exception as exc:
+        logger.debug("load_research_queue_items wrapper failed: %s", exc)
+        return []
+
+
+async def _complete_next_research_by_entity(world, ent) -> None:
+    if not _db_available():
+        return
+    try:
+        from src.models import Player
+        player = world.component_for_entity(ent, Player)
+        async with SessionLocal() as session:
+            result = await session.execute(
+                select(ORMRQI).where((ORMRQI.user_id == int(player.user_id)) & (ORMRQI.status == "pending")).order_by(ORMRQI.id.asc()).limit(1)
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return
+            await session.execute(update(ORMRQI).where(ORMRQI.id == row.id).values(status="completed"))
+            await session.commit()
+            try:
+                logger.info(
+                    "research_completed",
+                    extra={
+                        "action_type": "research_completed",
+                        "queue_item_id": int(getattr(row, "id", 0) or 0),
+                        "user_id": int(getattr(row, "user_id", 0) or 0),
+                        "research_type": str(getattr(row, "research_type", "")),
+                        "level": int(getattr(row, "level", 0) or 0),
+                    },
+                )
+            except Exception:
+                pass
+            metrics.increment_event("db.research_completed")
+    except SQLAlchemyError as exc:  # pragma: no cover
+        logger.warning("complete_next_research failed: %s", exc)
+
+
+def complete_next_research(world, ent) -> None:
+    if not _db_available():
+        return
+    try:
+        _submit(_complete_next_research_by_entity(world, ent), op="complete_next_research_by_entity")
+    except Exception as exc:
+        logger.debug("complete_next_research wrapper failed: %s", exc)

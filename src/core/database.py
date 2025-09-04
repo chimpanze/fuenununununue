@@ -18,8 +18,13 @@ from src.models.database import Base
 logger = logging.getLogger(__name__)
 
 # Async engine/session globals; initialize on app startup to bind to the running loop
-engine = None  # type: Optional[object]
-SessionLocal = None  # will be set to async_sessionmaker when started
+from typing import Optional, cast
+from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import async_sessionmaker as _AsyncSessionMaker
+
+engine: Optional[AsyncEngine] = None  # Created in start_db() on the owning asyncio loop
+# Note: SessionLocal is loop-affine; never access from non-owning threads.
+SessionLocal: Optional[_AsyncSessionMaker[AsyncSession]] = None  # set in start_db()
 _DB_ENABLED = False
 
 # Detect greenlet availability; SQLAlchemy relies on it in several execution paths
@@ -36,9 +41,19 @@ def is_db_enabled() -> bool:
 
 
 async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI dependency-style session generator."""
+    """FastAPI dependency-style session generator.
+
+    Raises a clear error when DB is disabled to guide configuration.
+    """
     if not is_db_enabled():
-        raise RuntimeError("Database disabled")
+        raise RuntimeError("Database is disabled. Enable it by setting ENABLE_DB=true and providing DATABASE_URL; install greenlet + asyncpg.")
+    # Structured debug with loop/thread identity
+    try:
+        import asyncio as _asyncio, threading as _threading
+        _loop = _asyncio.get_running_loop()
+        logger.debug("session_open", extra={"thread": _threading.current_thread().name, "loop_id": id(_loop)})
+    except Exception:
+        pass
     async with SessionLocal() as session:  # type: ignore[misc]
         yield session
 
@@ -78,20 +93,12 @@ def _engine_kwargs_for(url: str) -> dict:
         "future": True,
         "pool_pre_ping": DB_POOL_PRE_PING,
     }
-    try:
-        from sqlalchemy.pool import NullPool  # type: ignore
-    except Exception:  # pragma: no cover
-        NullPool = None  # type: ignore
-    is_sqlite = str(url).startswith("sqlite+")
-    if is_sqlite and NullPool is not None:
-        engine_kwargs["poolclass"] = NullPool
-    else:
-        engine_kwargs.update({
-            "pool_size": DB_POOL_SIZE,
-            "max_overflow": DB_MAX_OVERFLOW,
-            "pool_timeout": DB_POOL_TIMEOUT,
-            "pool_recycle": DB_POOL_RECYCLE,
-        })
+    engine_kwargs.update({
+        "pool_size": DB_POOL_SIZE,
+        "max_overflow": DB_MAX_OVERFLOW,
+        "pool_timeout": DB_POOL_TIMEOUT,
+        "pool_recycle": DB_POOL_RECYCLE,
+    })
     return engine_kwargs
 
 
@@ -114,7 +121,7 @@ async def get_readonly_async_session() -> AsyncGenerator[AsyncSession, None]:
     Falls back to the primary session factory when replicas are not configured.
     """
     if not is_db_enabled():
-        raise RuntimeError("Database disabled")
+        raise RuntimeError("Database is disabled. Enable it by setting ENABLE_DB=true and providing DATABASE_URL; install greenlet + asyncpg.")
     sessionmaker = _choose_read_sessionmaker()
     async with sessionmaker() as session:  # type: ignore[misc]
         yield session
@@ -134,9 +141,19 @@ async def init_db() -> None:
     """Initialize database schema in dev environments using metadata.create_all.
 
     For production, prefer Alembic migrations instead of create_all.
+    Only runs when DEV_CREATE_ALL is true; otherwise no-op.
     """
     if not is_db_enabled():
         logger.warning("init_db called but database is disabled")
+        return
+    try:
+        from src.core.config import get_dev_create_all
+        if not bool(get_dev_create_all()):
+            logger.info("init_db skipped (DEV_CREATE_ALL=false); rely on Alembic migrations")
+            return
+    except Exception:
+        # If config import fails, be safe and skip in unknown environments
+        logger.info("init_db skipped due to config error; rely on Alembic migrations")
         return
     async with engine.begin() as conn:  # type: ignore[assignment]
         await conn.run_sync(Base.metadata.create_all)
@@ -162,6 +179,15 @@ async def start_db() -> None:
     Safe to call multiple times; a no-op if already started.
     """
     global engine, SessionLocal, _DB_ENABLED, _replica_engines, _replica_sessionmakers, _replicas_enabled
+    # Allow tests and simple environments to disable DB explicitly
+    try:
+        import os, asyncio, threading
+        if os.environ.get("ENABLE_DB", "false").lower() != "true":
+            _DB_ENABLED = False
+            return
+    except Exception:
+        _DB_ENABLED = False
+        return
     if not _GREENLET_OK:
         logger.warning("greenlet not available; database layer will remain disabled")
         _DB_ENABLED = False
@@ -174,6 +200,11 @@ async def start_db() -> None:
     engine = create_async_engine(DATABASE_URL, **kwargs)
     SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     _DB_ENABLED = True
+    try:
+        loop = asyncio.get_running_loop()
+        logger.debug("db_start", extra={"thread": threading.current_thread().name, "loop_id": id(loop)})
+    except Exception:
+        pass
     # Initialize read-replicas if configured
     _replica_engines = []
     _replica_sessionmakers = []
@@ -197,6 +228,12 @@ async def shutdown_db() -> None:
     """
     global engine, SessionLocal, _DB_ENABLED, _replica_engines, _replica_sessionmakers, _replicas_enabled
     try:
+        import asyncio, threading
+        try:
+            loop = asyncio.get_running_loop()
+            logger.debug("db_shutdown", extra={"thread": threading.current_thread().name, "loop_id": id(loop)})
+        except Exception:
+            pass
         # Dispose primary engine
         if engine is not None:
             try:

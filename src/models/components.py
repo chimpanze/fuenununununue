@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Any
+from src.core.time_utils import utc_now, ensure_aware_utc
 
 
 @dataclass
@@ -24,7 +25,10 @@ class Player:
     """
     name: str
     user_id: int
-    last_active: datetime = field(default_factory=datetime.now)
+    last_active: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self):
+        self.last_active = ensure_aware_utc(self.last_active)
 
 
 @dataclass
@@ -44,7 +48,11 @@ class ResourceProduction:
     metal_rate: float = 30.0  # per hour
     crystal_rate: float = 20.0
     deuterium_rate: float = 10.0
-    last_update: datetime = field(default_factory=datetime.now)
+    last_update: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self):
+        # Normalize to aware UTC
+        self.last_update = ensure_aware_utc(self.last_update)
 
 
 @dataclass
@@ -111,6 +119,11 @@ class FleetMovement:
     mission: str = "transfer"
     owner_id: int = 0
     recalled: bool = False
+
+    def __post_init__(self):
+        # Normalize to aware UTC for time fields
+        self.departure_time = ensure_aware_utc(self.departure_time)
+        self.arrival_time = ensure_aware_utc(self.arrival_time)
 
 
 @dataclass

@@ -4,6 +4,8 @@ This document summarizes the current HTTP API. It will evolve as the project is 
 
 Base URL: http://localhost:8000
 
+Note: Persistence is Postgres-only; endpoints rely on the database as the single source of truth. File- or SQLite-based persistence has been removed (see docs/cleanup.md).
+
 ## Health
 - GET /  
   Response:

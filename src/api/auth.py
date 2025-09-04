@@ -22,7 +22,50 @@ from src.core.database import get_async_session, get_optional_async_session, is_
 from src.models.database import User as ORMUser, Planet as ORMPlanet, Building as ORMBuilding
 from src.core.state import game_world
 from src.models import Player, Position, Resources, ResourceProduction, Buildings, BuildQueue, ShipBuildQueue, Fleet, Research, ResearchQueue, Planet as PlanetComp
-from src.core.sync import load_player_into_world
+
+# Reusable dependency to ensure a player's data is present in the ECS world
+# Use in endpoints with user_id: add a parameter like `_pl=Depends(ensure_player_loaded)`
+# Returns True to allow unused assignment without lint noise.
+
+def ensure_player_loaded(user_id: int) -> bool:
+    """FastAPI dependency that ensures a player's ECS data is loaded.
+
+    If the player's data is not present in-memory, attempt to load it from
+    persistence using GameWorld.load_player_data(user_id). Any exceptions are
+    swallowed to preserve endpoint resilience; the endpoint should still
+    return 404 if the player truly does not exist.
+    """
+    try:
+        if game_world.get_player_data(user_id) is None:
+            game_world.load_player_data(user_id)
+            # Optional short wait/poll to allow async hydration to complete in DB-backed mode
+            import time
+            # Allow more time for DB hydration in docker-compose environments
+            deadline = time.perf_counter() + 2.0  # wait up to ~2s
+            while game_world.get_player_data(user_id) is None and time.perf_counter() < deadline:
+                time.sleep(0.02)  # 20ms backoff
+    except Exception:
+        # Non-fatal: endpoints will handle missing players explicitly
+        pass
+    return True
+
+# Variation for endpoints that authenticate via token and don't have user_id in the path
+# Example usage: `_pl=Depends(ensure_current_user_player_loaded)`
+
+def ensure_current_user_player_loaded(user: ORMUser = Depends(get_current_user)) -> bool:  # type: ignore[name-defined]
+    try:
+        uid = int(getattr(user, "id", 0))
+        if uid and game_world.get_player_data(uid) is None:
+            game_world.load_player_data(uid)
+            # Optional short wait/poll to allow async hydration to complete in DB-backed mode
+            import time
+            # Allow more time for DB hydration in docker-compose environments
+            deadline = time.perf_counter() + 2.0  # wait up to ~2s
+            while game_world.get_player_data(uid) is None and time.perf_counter() < deadline:
+                time.sleep(0.02)
+    except Exception:
+        pass
+    return True
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -91,7 +134,7 @@ async def register(payload: RegisterRequest, session: Optional[AsyncSession] = D
         # Ensure ECS Player is created/loaded for the new user (when auto-start is allowed)
         if not REQUIRE_START_CHOICE:
             try:
-                load_player_into_world(game_world.world, user_id)
+                game_world.load_player_data(user_id)
             except Exception:
                 pass
     else:
@@ -104,6 +147,19 @@ async def register(payload: RegisterRequest, session: Optional[AsyncSession] = D
 
         # Create ECS entity for the new user so /player/{id} works, unless start choice is required
         if not REQUIRE_START_CHOICE:
+            # Remove any stale ECS entities for this user_id (can occur across TestClient lifespans)
+            try:
+                to_delete = []
+                for ent, p in game_world.world.get_component(Player):
+                    if getattr(p, 'user_id', None) == user_id:
+                        to_delete.append(ent)
+                for ent in to_delete:
+                    try:
+                        game_world.world.delete_entity(ent)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             try:
                 game_world.world.create_entity(
                     Player(name=payload.username, user_id=user_id),
@@ -150,7 +206,7 @@ async def login(payload: LoginRequest, session: Optional[AsyncSession] = Depends
         user_id = mem_user.id
 
     try:
-        load_player_into_world(game_world.world, user_id)
+        game_world.load_player_data(user_id)
     except Exception:
         pass
 

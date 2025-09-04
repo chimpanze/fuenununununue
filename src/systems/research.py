@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
+from src.core.time_utils import utc_now, ensure_aware_utc
 import esper
 import logging
 
-from src.models import ResearchQueue, Research
+from src.models import ResearchQueue, Research, Player
+from src.core.sync import complete_next_research
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +19,7 @@ class ResearchSystem(esper.Processor):
     """
 
     def process(self) -> None:
-        current_time = datetime.now()
+        current_time = utc_now()
 
         world_obj = getattr(self, "world", None)
         getter = getattr(world_obj, "get_components", esper.get_components)
@@ -27,7 +28,13 @@ class ResearchSystem(esper.Processor):
                 continue
 
             current_item = rq.items[0]
-            if current_time >= current_item.get("completion_time", current_time):
+            ct = ensure_aware_utc(current_item.get("completion_time"))
+            if not ct:
+                # Invalid item; drop it
+                rq.items.pop(0)
+                continue
+            current_item["completion_time"] = ct
+            if current_time >= ct:
                 research_type = current_item.get("type")
                 if not research_type or not hasattr(research, research_type):
                     # Invalid queue item; drop it to prevent blocking
@@ -39,7 +46,7 @@ class ResearchSystem(esper.Processor):
                                 "action_type": "research_item_invalid",
                                 "entity": ent,
                                 "item": str(current_item),
-                                "timestamp": datetime.now().isoformat(),
+                                "timestamp": utc_now().isoformat(),
                             },
                         )
                     except Exception:
@@ -54,35 +61,42 @@ class ResearchSystem(esper.Processor):
                 # Remove completed item from queue
                 rq.items.pop(0)
 
-                # Emit real-time research completion to owning user (best-effort)
+                # Persist completion in DB (best-effort)
                 try:
-                    from src.models import Player as _P
-                    from src.api.ws import send_to_user as _ws_send
-                    player = self.world.component_for_entity(ent, _P)
+                    complete_next_research(self.world, ent)
+                except Exception:
+                    pass
+
+                # Best-effort: fetch player once and reuse for WS + notification
+                try:
+                    player = self.world.component_for_entity(ent, Player)
                     user_id = int(getattr(player, 'user_id', 0))
-                    if user_id:
+                except Exception:
+                    user_id = 0
+
+                # Emit real-time research completion to owning user (best-effort)
+                if user_id:
+                    try:
+                        from src.api.ws import send_to_user as _ws_send
                         _ws_send(user_id, {
                             "type": "research_complete",
                             "research_type": research_type,
                             "new_level": int(new_level),
-                            "ts": datetime.now().isoformat(),
+                            "ts": current_time.isoformat(),
                         })
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
                 # Persist offline notification store with info priority (best-effort)
-                try:
-                    from src.models import Player as _P2
-                    from src.core.notifications import create_notification as _notify
-                    player2 = self.world.component_for_entity(ent, _P2)
-                    uid2 = int(getattr(player2, 'user_id', 0))
-                    if uid2:
-                        _notify(uid2, "research_complete", {
+                if user_id:
+                    try:
+                        from src.core.notifications import create_notification as _notify
+                        _notify(user_id, "research_complete", {
                             "research_type": research_type,
                             "new_level": int(new_level),
                         }, priority="info")
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
                 try:
                     logger.info(
@@ -92,7 +106,7 @@ class ResearchSystem(esper.Processor):
                             "entity": ent,
                             "research_type": research_type,
                             "new_level": int(new_level),
-                            "timestamp": datetime.now().isoformat(),
+                            "timestamp": utc_now().isoformat(),
                         },
                     )
                 except Exception:

@@ -22,6 +22,7 @@ from sqlalchemy import (
     JSON,
 )
 from sqlalchemy.orm import declarative_base, relationship, Mapped, mapped_column
+from src.core.time_utils import utc_now
 
 Base = declarative_base()
 
@@ -33,7 +34,7 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(50), unique=True, index=True, nullable=False)
     email: Mapped[Optional[str]] = mapped_column(String(255), unique=True, index=True, nullable=True)
     password_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
     last_login: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
@@ -73,7 +74,7 @@ class Planet(Base):
     crystal_rate: Mapped[float] = mapped_column(Float, default=20.0, nullable=False)
     deuterium_rate: Mapped[float] = mapped_column(Float, default=10.0, nullable=False)
 
-    last_update: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    last_update: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
     owner: Mapped["User"] = relationship("User", back_populates="planets")
     buildings: Mapped[List["Building"]] = relationship("Building", back_populates="planet", cascade="all, delete-orphan")
@@ -141,7 +142,7 @@ class Notification(Base):
     type: Mapped[str] = mapped_column(String(50), nullable=False)
     payload: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     priority: Mapped[str] = mapped_column(String(20), nullable=False, default="normal")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     read_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
@@ -185,3 +186,109 @@ class TradeEvent(Base):
     requested_amount: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+
+
+class BattleReport(Base):
+    __tablename__ = "battle_reports"
+    __table_args__ = (
+        Index("ix_battle_reports_created_at", "created_at"),
+        Index("ix_battle_reports_attacker", "attacker_user_id"),
+        Index("ix_battle_reports_defender", "defender_user_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    attacker_user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    defender_user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    location: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    outcome: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+
+
+class EspionageReport(Base):
+    __tablename__ = "espionage_reports"
+    __table_args__ = (
+        Index("ix_espionage_reports_created_at", "created_at"),
+        Index("ix_espionage_reports_attacker", "attacker_user_id"),
+        Index("ix_espionage_reports_defender", "defender_user_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    attacker_user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    defender_user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    location: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    snapshot: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+
+
+class ShipBuildQueueItem(Base):
+    __tablename__ = "ship_build_queue"
+    __table_args__ = (
+        Index("ix_ship_queue_planet_id", "planet_id"),
+        Index("ix_ship_queue_completion_time", "completion_time"),
+        Index("ix_ship_queue_completed_at", "completed_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    planet_id: Mapped[int] = mapped_column(ForeignKey("planets.id", ondelete="CASCADE"), nullable=False)
+    ship_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    completion_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    enqueued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class FleetMission(Base):
+    __tablename__ = "fleet_missions"
+    __table_args__ = (
+        Index("ix_fleet_missions_user", "user_id"),
+        Index("ix_fleet_missions_arrival", "arrival_time"),
+        UniqueConstraint("user_id", name="uq_fleet_mission_user_open"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    origin_galaxy: Mapped[int] = mapped_column(Integer, nullable=False)
+    origin_system: Mapped[int] = mapped_column(Integer, nullable=False)
+    origin_planet: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_galaxy: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_system: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_planet: Mapped[int] = mapped_column(Integer, nullable=False)
+    mission: Mapped[str] = mapped_column(String(32), nullable=False, default="transfer")
+    speed: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    recalled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    departure_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    arrival_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class BuildingQueueItem(Base):
+    __tablename__ = "building_queue"
+    __table_args__ = (
+        Index("ix_build_queue_planet_id", "planet_id"),
+        Index("ix_build_queue_complete_at", "complete_at"),
+        Index("ix_build_queue_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    planet_id: Mapped[int] = mapped_column(ForeignKey("planets.id", ondelete="CASCADE"), nullable=False)
+    building_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    level: Mapped[int] = mapped_column(Integer, nullable=False)
+    enqueued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    complete_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+
+
+class ResearchQueueItem(Base):
+    __tablename__ = "research_queue"
+    __table_args__ = (
+        Index("ix_research_queue_user_id", "user_id"),
+        Index("ix_research_queue_complete_at", "complete_at"),
+        Index("ix_research_queue_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    research_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    level: Mapped[int] = mapped_column(Integer, nullable=False)
+    enqueued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    complete_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
