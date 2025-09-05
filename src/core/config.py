@@ -64,6 +64,12 @@ BASE_BUILDING_COSTS = {
     'solar_plant': {'metal': 75, 'crystal': 30, 'deuterium': 0},
     'robot_factory': {'metal': 400, 'crystal': 120, 'deuterium': 200},
     'shipyard': {'metal': 400, 'crystal': 200, 'deuterium': 100},
+    'research_lab': {'metal': 200, 'crystal': 400, 'deuterium': 0},
+    'fusion_reactor': {'metal': 900, 'crystal': 500, 'deuterium': 200},
+    # Storage buildings
+    'metal_storage': {'metal': 1000, 'crystal': 0, 'deuterium': 0},
+    'crystal_storage': {'metal': 800, 'crystal': 200, 'deuterium': 0},
+    'deuterium_tank': {'metal': 800, 'crystal': 0, 'deuterium': 200},
 }
 
 # Base build times in seconds
@@ -74,23 +80,52 @@ BASE_BUILD_TIMES = {
     'solar_plant': 50,
     'robot_factory': 300,
     'shipyard': 400,
+    'research_lab': 240,
+    'fusion_reactor': 360,
+    # Storage buildings
+    'metal_storage': 120,
+    'crystal_storage': 120,
+    'deuterium_tank': 120,
 }
 
 # Building prerequisites map: building -> {required_building: min_level}
 PREREQUISITES = {
     # Example: shipyard requires robot factory level 2
     'shipyard': {'robot_factory': 2},
+    # Fusion reactor requires at least some deuterium infrastructure
+    'fusion_reactor': {'deuterium_synthesizer': 1},
 }
 
 # Energy system parameters
 # Base energy produced by solar plant per level (approximate)
 ENERGY_SOLAR_BASE: float = 20.0
+# Optional non-linear growth for solar plant energy production per level.
+# Effective formula: ENERGY_SOLAR_BASE * level * (ENERGY_SOLAR_GROWTH ** max(0, level-1))
+# Default 1.0 preserves legacy linear behavior.
+ENERGY_SOLAR_GROWTH: float = float(os.environ.get("ENERGY_SOLAR_GROWTH", "1.0"))
+# Fusion reactor energy production (per level) and deuterium consumption
+FUSION_ENERGY_BASE: float = float(os.environ.get("FUSION_ENERGY_BASE", "30.0"))
+FUSION_ENERGY_GROWTH: float = float(os.environ.get("FUSION_ENERGY_GROWTH", "1.0"))
+# Deuterium consumption per level per hour when fusion reactor is active
+FUSION_DEUTERIUM_CONSUMPTION_PER_LEVEL: float = float(os.environ.get("FUSION_DEUTERIUM_CONSUMPTION_PER_LEVEL", "5.0"))
 # Base energy consumption per building per level
 ENERGY_CONSUMPTION = {
     'metal_mine': 3.0,
     'crystal_mine': 2.0,
     'deuterium_synthesizer': 2.0,
 }
+# Optional non-linear growth for per-level energy consumption.
+# Effective formula per building: BASE * level * (ENERGY_CONSUMPTION_GROWTH ** max(0, level-1))
+# Default 1.0 preserves legacy linear behavior.
+ENERGY_CONSUMPTION_GROWTH: float = float(os.environ.get("ENERGY_CONSUMPTION_GROWTH", "1.0"))
+
+# Soft floor for energy deficit production scaling (fraction 0..1)
+# Applied only when ENERGY_REQUIRED > 0 and ENERGY_PRODUCED > 0; zero energy still yields factor=0.
+ENERGY_DEFICIT_SOFT_FLOOR: float = float(os.environ.get("ENERGY_DEFICIT_SOFT_FLOOR", "0.25"))
+# Threshold at or below which to emit energy deficit warnings
+ENERGY_DEFICIT_NOTIFY_THRESHOLD: float = float(os.environ.get("ENERGY_DEFICIT_NOTIFY_THRESHOLD", "0.25"))
+# Cooldown in seconds for repeated energy deficit warnings per user/planet
+ENERGY_DEFICIT_NOTIFICATION_COOLDOWN_SECONDS: int = int(os.environ.get("ENERGY_DEFICIT_NOTIFICATION_COOLDOWN_SECONDS", "300"))
 
 
 # Research base costs (per level 0 -> level 1 baseline)
@@ -114,9 +149,19 @@ BASE_RESEARCH_TIMES = {
 }
 
 # Research prerequisites map: research -> {required_research: min_level}
-# Example: plasma technology requires energy technology level 8
+# Expanded per docs/tasks.md #66: ion requires laser 4; hyperspace requires energy 6 + laser 6; plasma requires energy 8 + ion 5
 RESEARCH_PREREQUISITES = {
-    'plasma': {'energy': 8},
+    'ion': {
+        'laser': 4,
+    },
+    'hyperspace': {
+        'energy': 6,
+        'laser': 6,
+    },
+    'plasma': {
+        'energy': 8,
+        'ion': 5,
+    },
 }
 
 # Research effects configuration
@@ -130,8 +175,16 @@ PLASMA_PRODUCTION_BONUS = {
 ENERGY_TECH_ENERGY_BONUS_PER_LEVEL: float = 0.02
 # Hyperspace technology reduces building construction times (fraction per level)
 BUILD_TIME_REDUCTION_PER_HYPERSPACE_LEVEL: float = 0.02
+# Robot Factory reduces building construction time (fraction per level)
+ROBOT_FACTORY_BUILD_TIME_REDUCTION_PER_LEVEL: float = float(os.environ.get("ROBOT_FACTORY_BUILD_TIME_REDUCTION_PER_LEVEL", "0.02"))
+# Shipyard level reduces ship build time (fraction per level)
+SHIPYARD_BUILD_TIME_REDUCTION_PER_LEVEL: float = float(os.environ.get("SHIPYARD_BUILD_TIME_REDUCTION_PER_LEVEL", "0.05"))
+# Research Lab reduces research time (fraction per level)
+RESEARCH_LAB_TIME_REDUCTION_PER_LEVEL: float = float(os.environ.get("RESEARCH_LAB_TIME_REDUCTION_PER_LEVEL", "0.03"))
 # Minimum clamp factor for build time after reductions (e.g., 0.5 = cannot go below 50% of base)
 MIN_BUILD_TIME_FACTOR: float = 0.5
+# Minimum clamp factor for research time after reductions
+MIN_RESEARCH_TIME_FACTOR: float = 0.5
 
 # Base ship stats used to derive final stats with research modifiers
 BASE_SHIP_STATS = {
@@ -157,7 +210,7 @@ BASE_SHIP_COSTS = {
     'cruiser': {'metal': 2000, 'crystal': 1500, 'deuterium': 200},
     'battleship': {'metal': 6000, 'crystal': 4000, 'deuterium': 0},
     'bomber': {'metal': 5000, 'crystal': 3000, 'deuterium': 1000},
-    'colony_ship': {'metal': 300, 'crystal': 150, 'deuterium': 0},
+    'colony_ship': {'metal': 450, 'crystal': 225, 'deuterium': 0},  # Raised baseline (docs/tasks.md #59)
 }
 
 # Base ship build times in seconds (per unit)
@@ -178,11 +231,31 @@ COLONIZATION_TIME_SECONDS: int = int(os.environ.get("COLONIZATION_TIME_SECONDS",
 # Max total ships (sum of all types) allowed at any time on a planet
 BASE_MAX_FLEET_SIZE: int = int(os.environ.get("BASE_MAX_FLEET_SIZE", "50"))
 FLEET_SIZE_PER_COMPUTER_LEVEL: int = int(os.environ.get("FLEET_SIZE_PER_COMPUTER_LEVEL", "10"))
+# Shipyard queue size limit: base + per-level growth
+SHIPYARD_QUEUE_BASE_LIMIT: int = int(os.environ.get("SHIPYARD_QUEUE_BASE_LIMIT", "2"))
+SHIPYARD_QUEUE_PER_LEVEL: int = int(os.environ.get("SHIPYARD_QUEUE_PER_LEVEL", "1"))
 
 # Universe dimensions (from docs/requirements.md PM-003)
 GALAXY_COUNT: int = int(os.environ.get("GALAXY_COUNT", "9"))
 SYSTEMS_PER_GALAXY: int = int(os.environ.get("SYSTEMS_PER_GALAXY", "499"))
 POSITIONS_PER_SYSTEM: int = int(os.environ.get("POSITIONS_PER_SYSTEM", "15"))
+
+# Economy and Market configuration (soft guidance)
+# Target exchange ratios (relative weights). Interpreted as metal:crystal:deuterium guidance.
+# Example default: 3:2:1 implies 3 metal ~= 2 crystal ~= 1 deuterium in value terms.
+EXCHANGE_RATIOS = {
+    'metal': float(os.environ.get('EXCHANGE_RATIO_METAL', '3.0')),
+    'crystal': float(os.environ.get('EXCHANGE_RATIO_CRYSTAL', '2.0')),
+    'deuterium': float(os.environ.get('EXCHANGE_RATIO_DEUTERIUM', '1.0')),
+}
+# Transaction fee rate applied to seller proceeds (0.0..1.0). Default 0.0 (no fee).
+TRADE_TRANSACTION_FEE_RATE: float = float(os.environ.get('TRADE_TRANSACTION_FEE_RATE', '0.0'))
+
+# Feature flags for phased rollout of newer buildings/systems
+FEATURE_ENABLE_STORAGE_BUILDINGS: bool = os.environ.get('FEATURE_ENABLE_STORAGE_BUILDINGS', 'true').lower() == 'true'
+FEATURE_ENABLE_FUSION_REACTOR: bool = os.environ.get('FEATURE_ENABLE_FUSION_REACTOR', 'true').lower() == 'true'
+FEATURE_ENABLE_ROBOT_FACTORY: bool = os.environ.get('FEATURE_ENABLE_ROBOT_FACTORY', 'true').lower() == 'true'
+FEATURE_ENABLE_RESEARCH_LAB: bool = os.environ.get('FEATURE_ENABLE_RESEARCH_LAB', 'true').lower() == 'true'
 
 # Galaxy seeding configuration
 # Target maximum concurrent players expected in the universe (used for planning scale)
@@ -208,6 +281,85 @@ PLANET_SIZE_MIN: int = int(os.environ.get('PLANET_SIZE_MIN', '140'))
 PLANET_SIZE_MAX: int = int(os.environ.get('PLANET_SIZE_MAX', '200'))
 PLANET_TEMPERATURE_MIN: int = int(os.environ.get('PLANET_TEMPERATURE_MIN', '-40'))
 PLANET_TEMPERATURE_MAX: int = int(os.environ.get('PLANET_TEMPERATURE_MAX', '60'))
+
+# Base per-building production rates (per hour) used when USE_CONFIG_PRODUCTION_RATES is true.
+BASE_PRODUCTION_RATES = {
+    'metal_mine': float(os.environ.get('BASE_METAL_MINE_RATE', '30.0')),
+    'crystal_mine': float(os.environ.get('BASE_CRYSTAL_MINE_RATE', '20.0')),
+    'deuterium_synthesizer': float(os.environ.get('BASE_DEUTERIUM_SYNTH_RATE', '10.0')),
+}
+# Feature flag to use config base rates instead of ResourceProduction component rates.
+USE_CONFIG_PRODUCTION_RATES: bool = os.environ.get('USE_CONFIG_PRODUCTION_RATES', 'false').lower() == 'true'
+
+# Storage capacity configuration
+# Base capacity when storage level is 0 and exponential growth per level.
+STORAGE_BASE_CAPACITY = {
+    'metal': int(os.environ.get('BASE_METAL_CAPACITY', '100000')),
+    'crystal': int(os.environ.get('BASE_CRYSTAL_CAPACITY', '75000')),
+    'deuterium': int(os.environ.get('BASE_DEUTERIUM_CAPACITY', '50000')),
+}
+STORAGE_CAPACITY_GROWTH = {
+    'metal': float(os.environ.get('METAL_STORAGE_GROWTH', '2.0')),
+    'crystal': float(os.environ.get('CRYSTAL_STORAGE_GROWTH', '2.0')),
+    'deuterium': float(os.environ.get('DEUTERIUM_TANK_GROWTH', '2.0')),
+}
+
+# Planet modifier helpers.
+# Temperature affects deuterium production efficiency (docs/tasks.md #71).
+# Cold planets yield more deuterium; very hot planets yield less.
+# Piecewise-linear curve chosen for simplicity and backward-compatibility.
+# Ranges (deg C) -> multiplier:
+#   <= -40: 1.20
+#   -40..0:  1.10
+#   0..25:   1.00
+#   25..50:  0.90
+#   > 50:    0.80
+# These defaults can be tuned later via env-driven mapping if needed.
+def temperature_multiplier(temperature_c: int) -> float:
+    """Return a multiplier (>=0) reflecting deuterium efficiency by temperature.
+
+    Note: This multiplier is applied only to deuterium production in systems,
+    keeping metal/crystal unaffected by temperature to minimize balance impact.
+    """
+    try:
+        t = int(temperature_c)
+        if t <= -40:
+            return 1.20
+        if t <= 0:
+            return 1.10
+        if t <= 25:
+            return 1.00
+        if t <= 50:
+            return 0.90
+        return 0.80
+    except Exception:
+        return 1.0
+
+# Size multiplier affects production and storage capacity efficiency (docs/tasks.md #72).
+# Simple piecewise curve chosen for clarity and backward-compatible ranges:
+#   <= 150 fields:   0.90 (tight planet; less capacity/efficiency)
+#   151..175 fields: 1.00 (baseline)
+#   > 175 fields:    1.10 (spacious planet; more capacity/efficiency)
+# This multiplier is applied in ResourceProductionSystem to both base production
+# and storage capacity calculations.
+
+def size_multiplier(size: int) -> float:
+    """Return a multiplier for production/capacity based on planet size.
+
+    Args:
+        size: planet size in fields (int)
+    Returns:
+        A non-negative multiplier.
+    """
+    try:
+        s = int(size)
+        if s <= 150:
+            return 0.90
+        if s <= 175:
+            return 1.00
+        return 1.10
+    except Exception:
+        return 1.0
 
 
 # --- Typed getters (single source of truth) ---

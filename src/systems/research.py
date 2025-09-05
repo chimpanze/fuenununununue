@@ -6,6 +6,7 @@ import logging
 
 from src.models import ResearchQueue, Research, Player
 from src.core.sync import complete_next_research
+from src.core.metrics import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,17 @@ class ResearchSystem(esper.Processor):
                 current_level = getattr(research, research_type)
                 new_level = int(current_level) + 1
                 setattr(research, research_type, new_level)
+
+                # Record actual research queue duration metrics
+                try:
+                    q_at = current_item.get('queued_at')
+                    if q_at is not None:
+                        q_at = ensure_aware_utc(q_at)
+                        duration_s = max(0.0, (current_time - q_at).total_seconds())
+                        metrics.record_timer("queue.research.actual_s", float(duration_s))
+                    metrics.increment_event("queue.research.completed", 1)
+                except Exception:
+                    pass
 
                 # Remove completed item from queue
                 rq.items.pop(0)

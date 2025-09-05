@@ -51,6 +51,7 @@ from src.systems import (
 
 logger = logging.getLogger(__name__)
 from src.core.metrics import metrics
+from src.core.config import TRADE_TRANSACTION_FEE_RATE
 from src.core.commands import (
     parse_build_building,
     parse_demolish_building,
@@ -459,14 +460,17 @@ class GameWorld:
             current_level = getattr(buildings, building_type, 0) if hasattr(buildings, building_type) else 0
             cost = self._calculate_building_cost(building_type, current_level)
             build_time = self._calculate_build_time(building_type, current_level)
-            # Apply research-based build time reduction (hyperspace)
+            # Apply build time reductions: hyperspace research (player) and robot_factory (planet)
             try:
-                from src.models import Research as _R
-                from src.core.config import BUILD_TIME_REDUCTION_PER_HYPERSPACE_LEVEL, MIN_BUILD_TIME_FACTOR
+                from src.models import Research as _R, Buildings as _B
+                from src.core.config import BUILD_TIME_REDUCTION_PER_HYPERSPACE_LEVEL, ROBOT_FACTORY_BUILD_TIME_REDUCTION_PER_LEVEL, MIN_BUILD_TIME_FACTOR
                 r = self.world.component_for_entity(ent, _R)
                 hyper_lvl = int(getattr(r, 'hyperspace', 0)) if r is not None else 0
-                reduction = max(MIN_BUILD_TIME_FACTOR, 1.0 - BUILD_TIME_REDUCTION_PER_HYPERSPACE_LEVEL * hyper_lvl)
-                build_time = int(max(1, build_time * reduction))
+                bld_comp = self.world.component_for_entity(ent, _B)
+                rf_lvl = int(getattr(bld_comp, 'robot_factory', 0)) if bld_comp is not None else 0
+                factor = (1.0 - BUILD_TIME_REDUCTION_PER_HYPERSPACE_LEVEL * hyper_lvl) * (1.0 - ROBOT_FACTORY_BUILD_TIME_REDUCTION_PER_LEVEL * rf_lvl)
+                factor = max(MIN_BUILD_TIME_FACTOR, factor)
+                build_time = int(max(1, build_time * factor))
             except Exception:
                 pass
 
@@ -489,10 +493,17 @@ class GameWorld:
                 # Add to build queue
                 # Use naive local datetime for compatibility with tests; systems normalize to UTC when processing
                 completion_time = datetime.now() + timedelta(seconds=build_time)
+                # Planned duration metric
+                try:
+                    metrics.record_timer("queue.build.planned_s", float(build_time))
+                except Exception:
+                    pass
                 build_queue.items.append({
                     'type': building_type,
                     'completion_time': completion_time,
                     'cost': cost,
+                    'queued_at': datetime.now(),
+                    'expected_duration_s': int(build_time),
                 })
 
                 # Persist to DB queue (best-effort)
@@ -555,6 +566,16 @@ class GameWorld:
             current_level = getattr(research, research_type, 0)
             cost = self._calculate_research_cost(research_type, current_level)
             duration = self._calculate_research_time(research_type, current_level)
+            # Apply research time reduction via research_lab on active planet
+            try:
+                from src.models import Buildings as _B
+                from src.core.config import RESEARCH_LAB_TIME_REDUCTION_PER_LEVEL, MIN_RESEARCH_TIME_FACTOR
+                bld_comp = self.world.component_for_entity(ent, _B)
+                lab_lvl = int(getattr(bld_comp, 'research_lab', 0)) if bld_comp is not None else 0
+                factor = max(MIN_RESEARCH_TIME_FACTOR, 1.0 - RESEARCH_LAB_TIME_REDUCTION_PER_LEVEL * lab_lvl)
+                duration = int(max(1, duration * factor))
+            except Exception:
+                pass
             # Check resources
             if (
                 resources.metal >= cost['metal'] and
@@ -566,10 +587,17 @@ class GameWorld:
                 resources.crystal -= cost['crystal']
                 resources.deuterium -= cost['deuterium']
                 completion_time = datetime.now() + timedelta(seconds=duration)
+                # Planned duration metric
+                try:
+                    metrics.record_timer("queue.research.planned_s", float(duration))
+                except Exception:
+                    pass
                 research_queue.items.append({
                     'type': research_type,
                     'completion_time': completion_time,
                     'cost': cost,
+                    'queued_at': datetime.now(),
+                    'expected_duration_s': int(duration),
                 })
                 # Persist to DB research queue (best-effort)
                 try:
@@ -681,13 +709,26 @@ class GameWorld:
                 'deuterium': int(per_cost.get('deuterium', 0)) * quantity,
             }
             duration = per_time * quantity
-            # Apply hyperspace reduction to duration
+            # Apply combined reductions: hyperspace research, shipyard level, and robot factory level
             try:
                 from src.models import Research as _R
+                from src.core.config import SHIPYARD_BUILD_TIME_REDUCTION_PER_LEVEL, ROBOT_FACTORY_BUILD_TIME_REDUCTION_PER_LEVEL
                 r = self.world.component_for_entity(ent, _R)
                 hyper_lvl = int(getattr(r, 'hyperspace', 0)) if r is not None else 0
-                reduction = max(MIN_BUILD_TIME_FACTOR, 1.0 - BUILD_TIME_REDUCTION_PER_HYPERSPACE_LEVEL * hyper_lvl)
-                duration = int(max(1, duration * reduction))
+                # Base multiplicative factors (each cannot reduce below MIN_BUILD_TIME_FACTOR when combined)
+                hyper_factor = max(0.0, 1.0 - BUILD_TIME_REDUCTION_PER_HYPERSPACE_LEVEL * hyper_lvl)
+                shipyard_factor = 1.0
+                robot_factor = 1.0
+                try:
+                    # Use existing shipyard_level from above and robot_factory level from Buildings
+                    shipyard_factor = max(0.0, 1.0 - SHIPYARD_BUILD_TIME_REDUCTION_PER_LEVEL * max(0, shipyard_level))
+                    robot_lvl = int(getattr(buildings, 'robot_factory', 0)) if hasattr(buildings, 'robot_factory') else 0
+                    robot_factor = max(0.0, 1.0 - ROBOT_FACTORY_BUILD_TIME_REDUCTION_PER_LEVEL * max(0, robot_lvl))
+                except Exception:
+                    pass
+                combined = hyper_factor * shipyard_factor * robot_factor
+                final_factor = max(MIN_BUILD_TIME_FACTOR, combined)
+                duration = int(max(1, duration * final_factor))
             except Exception:
                 pass
             # Check resources
@@ -715,13 +756,44 @@ class GameWorld:
                         self.world.add_component(ent, ship_queue)
                     except Exception:
                         pass
+                # Enforce shipyard queue size limit before enqueueing
+                try:
+                    from src.core.config import SHIPYARD_QUEUE_BASE_LIMIT, SHIPYARD_QUEUE_PER_LEVEL
+                    current_len = 0
+                    if getattr(ship_queue, 'items', None):
+                        current_len = len(ship_queue.items)
+                    queue_limit = int(SHIPYARD_QUEUE_BASE_LIMIT) + int(SHIPYARD_QUEUE_PER_LEVEL) * max(0, int(shipyard_level))
+                    if current_len >= queue_limit:
+                        try:
+                            logger.info(
+                                "shipyard_queue_full",
+                                extra={
+                                    "action_type": "shipyard_queue_full",
+                                    "user_id": user_id,
+                                    "current_len": current_len,
+                                    "queue_limit": queue_limit,
+                                    "timestamp": datetime.now().isoformat(),
+                                },
+                            )
+                        except Exception:
+                            pass
+                        return
+                except Exception:
+                    pass
                 # Queue the construction
                 completion_time = datetime.now() + timedelta(seconds=duration)
+                # Planned duration metric
+                try:
+                    metrics.record_timer("queue.ship.planned_s", float(duration))
+                except Exception:
+                    pass
                 ship_queue.items.append({
                     'type': ship_type,
                     'count': quantity,
                     'completion_time': completion_time,
                     'cost': total_cost,
+                    'queued_at': datetime.now(),
+                    'expected_duration_s': int(duration),
                 })
                 # Persist to DB best-effort when enabled
                 try:
@@ -1193,6 +1265,11 @@ class GameWorld:
                         'solar_plant': buildings.solar_plant,
                         'robot_factory': buildings.robot_factory,
                         'shipyard': buildings.shipyard,
+                        'research_lab': getattr(buildings, 'research_lab', 0),
+                        'fusion_reactor': getattr(buildings, 'fusion_reactor', 0),
+                        'metal_storage': getattr(buildings, 'metal_storage', 0),
+                        'crystal_storage': getattr(buildings, 'crystal_storage', 0),
+                        'deuterium_tank': getattr(buildings, 'deuterium_tank', 0),
                     },
                     'build_queue': [
                         {
@@ -1452,7 +1529,7 @@ class GameWorld:
                 try:
                     from src.models import Buildings as B
                     b = self.world.component_for_entity(ent, B)
-                    for attr in ("metal_mine", "crystal_mine", "deuterium_synthesizer", "solar_plant", "robot_factory", "shipyard"):
+                    for attr in ("metal_mine", "crystal_mine", "deuterium_synthesizer", "solar_plant", "robot_factory", "shipyard", "metal_storage", "crystal_storage", "deuterium_tank", "research_lab", "fusion_reactor"):
                         if hasattr(b, attr):
                             lvl = getattr(b, attr)
                             sync_building_level(self.world, ent, attr, int(lvl))
@@ -1493,13 +1570,19 @@ class GameWorld:
         """
         try:
             now = utc_now()
-            from src.models import Resources as _Res, ResourceProduction as _Prod, Buildings as _Bld, Research as _Resh
+            from src.models import Resources as _Res, ResourceProduction as _Prod, Buildings as _Bld, Research as _Resh, Planet as _Pln
             # Import config constants locally to avoid widening module imports
             from src.core.config import (
                 ENERGY_SOLAR_BASE as _ENERGY_SOLAR_BASE,
                 ENERGY_CONSUMPTION as _ENERGY_CONSUMPTION,
                 PLASMA_PRODUCTION_BONUS as _PLASMA_BONUS,
                 ENERGY_TECH_ENERGY_BONUS_PER_LEVEL as _ENERGY_BONUS_PER_LVL,
+                ENERGY_SOLAR_GROWTH as _ENERGY_SOLAR_GROWTH,
+                ENERGY_CONSUMPTION_GROWTH as _ENERGY_CONSUMPTION_GROWTH,
+                BASE_PRODUCTION_RATES as _BASE_PRODUCTION_RATES,
+                USE_CONFIG_PRODUCTION_RATES as _USE_CONFIG_PRODUCTION_RATES,
+                temperature_multiplier as _temperature_multiplier,
+                size_multiplier as _size_multiplier,
             )
             getter = getattr(self.world, "get_components", esper.get_components)
             for ent, (resources, production, buildings) in getter(_Res, _Prod, _Bld):
@@ -1519,16 +1602,56 @@ class GameWorld:
                         pass
                     # Energy balance factor
                     energy_bonus_factor = 1.0 + (_ENERGY_BONUS_PER_LVL * energy_lvl)
-                    energy_produced = _ENERGY_SOLAR_BASE * max(0, getattr(buildings, 'solar_plant', 0)) * energy_bonus_factor
+                    sp_lvl = max(0, int(getattr(buildings, 'solar_plant', 0)))
+                    energy_produced = (
+                        _ENERGY_SOLAR_BASE * sp_lvl * (_ENERGY_SOLAR_GROWTH ** max(0, sp_lvl - 1))
+                    ) * energy_bonus_factor
+                    # Consumption with optional non-linear growth per level
+                    def _consumption(_base: float, _lvl: int) -> float:
+                        _lvl = max(0, int(_lvl))
+                        return _base * _lvl * (_ENERGY_CONSUMPTION_GROWTH ** max(0, _lvl - 1))
                     energy_required = 0.0
-                    energy_required += _ENERGY_CONSUMPTION.get('metal_mine', 0.0) * max(0, getattr(buildings, 'metal_mine', 0))
-                    energy_required += _ENERGY_CONSUMPTION.get('crystal_mine', 0.0) * max(0, getattr(buildings, 'crystal_mine', 0))
-                    energy_required += _ENERGY_CONSUMPTION.get('deuterium_synthesizer', 0.0) * max(0, getattr(buildings, 'deuterium_synthesizer', 0))
-                    factor = 1.0 if energy_required <= 0 else min(1.0, energy_produced / energy_required)
-                    # Base production with building multipliers
-                    metal_prod = production.metal_rate * (1.1 ** max(0, getattr(buildings, 'metal_mine', 0))) * hours * factor
-                    crystal_prod = production.crystal_rate * (1.1 ** max(0, getattr(buildings, 'crystal_mine', 0))) * hours * factor
-                    deuterium_prod = production.deuterium_rate * (1.1 ** max(0, getattr(buildings, 'deuterium_synthesizer', 0))) * hours * factor
+                    energy_required += _consumption(_ENERGY_CONSUMPTION.get('metal_mine', 0.0), getattr(buildings, 'metal_mine', 0))
+                    energy_required += _consumption(_ENERGY_CONSUMPTION.get('crystal_mine', 0.0), getattr(buildings, 'crystal_mine', 0))
+                    energy_required += _consumption(_ENERGY_CONSUMPTION.get('deuterium_synthesizer', 0.0), getattr(buildings, 'deuterium_synthesizer', 0))
+                    # Apply energy factor with soft floor when there is some production and some requirement
+                    if energy_required <= 0:
+                        factor_raw = 1.0
+                        factor = 1.0
+                    elif energy_produced <= 0:
+                        factor_raw = 0.0
+                        factor = 0.0
+                    else:
+                        factor_raw = min(1.0, energy_produced / energy_required)
+                        from src.core.config import ENERGY_DEFICIT_SOFT_FLOOR as _SOFT_FLOOR
+                        factor = max(float(_SOFT_FLOOR), float(factor_raw))
+
+                    # Determine base production rates (config-driven if enabled)
+                    if _USE_CONFIG_PRODUCTION_RATES:
+                        base_metal = _BASE_PRODUCTION_RATES.get('metal_mine', production.metal_rate)
+                        base_crystal = _BASE_PRODUCTION_RATES.get('crystal_mine', production.crystal_rate)
+                        base_deut = _BASE_PRODUCTION_RATES.get('deuterium_synthesizer', production.deuterium_rate)
+                    else:
+                        base_metal = production.metal_rate
+                        base_crystal = production.crystal_rate
+                        base_deut = production.deuterium_rate
+
+                    # Planet modifiers (neutral 1.0 by default)
+                    _temp_mult = 1.0
+                    _size_mult = 1.0
+                    try:
+                        _planet = self.world.component_for_entity(ent, _Pln)
+                        _temp_mult = float(_temperature_multiplier(int(getattr(_planet, 'temperature', 25))))
+                        _size_mult = float(_size_multiplier(int(getattr(_planet, 'size', 163))))
+                    except Exception:
+                        pass
+                    # Apply size multiplier to all resources; temperature only to deuterium
+                    _planet_mult_size = _size_mult
+
+                    # Base production with building multipliers and planet/energy modifiers
+                    metal_prod = base_metal * (1.1 ** max(0, getattr(buildings, 'metal_mine', 0))) * hours * factor * _planet_mult_size
+                    crystal_prod = base_crystal * (1.1 ** max(0, getattr(buildings, 'crystal_mine', 0))) * hours * factor * _planet_mult_size
+                    deuterium_prod = base_deut * (1.1 ** max(0, getattr(buildings, 'deuterium_synthesizer', 0))) * hours * factor * _planet_mult_size * _temp_mult
                     if plasma_lvl > 0:
                         metal_prod *= (1.0 + _PLASMA_BONUS.get('metal', 0.0) * plasma_lvl)
                         crystal_prod *= (1.0 + _PLASMA_BONUS.get('crystal', 0.0) * plasma_lvl)
@@ -1536,10 +1659,30 @@ class GameWorld:
                     d_metal = int(round(metal_prod))
                     d_crystal = int(round(crystal_prod))
                     d_deut = int(round(deuterium_prod))
-                    if d_metal or d_crystal or d_deut:
-                        resources.metal += d_metal
-                        resources.crystal += d_crystal
-                        resources.deuterium += d_deut
+
+                    # Capacity clamping based on storage building levels
+                    try:
+                        from src.core.config import STORAGE_BASE_CAPACITY as _SBC, STORAGE_CAPACITY_GROWTH as _SCG
+                        ms_lvl = max(0, int(getattr(buildings, 'metal_storage', 0)))
+                        cs_lvl = max(0, int(getattr(buildings, 'crystal_storage', 0)))
+                        dt_lvl = max(0, int(getattr(buildings, 'deuterium_tank', 0)))
+                        cap_m = int(_SBC.get('metal', 0) * (_SCG.get('metal', 1.0) ** ms_lvl))
+                        cap_c = int(_SBC.get('crystal', 0) * (_SCG.get('crystal', 1.0) ** cs_lvl))
+                        cap_d = int(_SBC.get('deuterium', 0) * (_SCG.get('deuterium', 1.0) ** dt_lvl))
+                    except Exception:
+                        cap_m = cap_c = cap_d = 2**31 - 1
+
+                    # Apply deltas with clamping
+                    before_m = resources.metal
+                    before_c = resources.crystal
+                    before_d = resources.deuterium
+                    add_m = max(0, min(d_metal, max(0, cap_m - before_m)))
+                    add_c = max(0, min(d_crystal, max(0, cap_c - before_c)))
+                    add_d = max(0, min(d_deut, max(0, cap_d - before_d)))
+                    if add_m or add_c or add_d:
+                        resources.metal = before_m + add_m
+                        resources.crystal = before_c + add_c
+                        resources.deuterium = before_d + add_d
                     # Reset last_update to now to avoid double-accrual on first tick
                     production.last_update = now
                 except Exception:
@@ -1987,16 +2130,36 @@ class GameWorld:
         if buyer_has < requested_amount:
             return False
 
-        # Apply transfers: buyer -> seller (requested), escrow -> buyer (offered)
+        # Apply transfers: buyer -> seller (requested minus fee), escrow -> buyer (offered)
         try:
+            # Buyer pays full requested amount
             setattr(buyer_res, requested_resource, buyer_has - requested_amount)
-            seller_current_req = int(getattr(seller_res, requested_resource, 0))
-            setattr(seller_res, requested_resource, seller_current_req + requested_amount)
 
+            # Calculate fee and net to seller
+            fee_rate = float(TRADE_TRANSACTION_FEE_RATE)
+            fee_amount = int(requested_amount * fee_rate) if fee_rate > 0.0 else 0
+            if fee_amount < 0:
+                fee_amount = 0
+            if fee_amount > requested_amount:
+                fee_amount = requested_amount
+            net_to_seller = requested_amount - fee_amount
+
+            # Seller receives net; fee is burned (not added to any player)
+            seller_current_req = int(getattr(seller_res, requested_resource, 0))
+            setattr(seller_res, requested_resource, seller_current_req + net_to_seller)
+
+            # Buyer receives offered resource from escrow
             buyer_current_offered = int(getattr(buyer_res, offered_resource, 0))
             setattr(buyer_res, offered_resource, buyer_current_offered + offered_amount)
         except Exception:
             return False
+
+        # Metrics: track fee collected (units of requested resource)
+        try:
+            if fee_amount:
+                metrics.increment_event("trade.fee_collected", fee_amount)
+        except Exception:
+            pass
 
         # Mark offer as accepted
         offer["status"] = "accepted"

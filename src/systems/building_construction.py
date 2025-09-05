@@ -9,6 +9,7 @@ from src.models import BuildQueue, Resources, Buildings, Player
 from src.core.sync import sync_building_level, complete_next_build_queue
 from src.api.ws import send_to_user
 from src.core.notifications import create_notification
+from src.core.metrics import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,17 @@ class BuildingConstructionSystem(esper.Processor):
                         sync_building_level(self.world, ent, building_type, new_level)
                     except Exception:
                         pass
+
+                # Record actual queue duration metrics before removing item
+                try:
+                    q_at = current_build.get('queued_at')
+                    if q_at is not None:
+                        q_at = ensure_aware_utc(q_at)
+                        duration_s = max(0.0, (current_time - q_at).total_seconds())
+                        metrics.record_timer("queue.build.actual_s", float(duration_s))
+                    metrics.increment_event("queue.build.completed", 1)
+                except Exception:
+                    pass
 
                 # Remove completed item from queue
                 build_queue.items.pop(0)

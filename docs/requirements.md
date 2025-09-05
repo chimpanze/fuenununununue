@@ -500,3 +500,51 @@ GET /battle-reports/{report_id} - Get specific battle report
 ---
 
 *This document serves as the definitive requirements specification for the Ogame-like game server project. All development work should align with these requirements, and any changes must be approved through the formal change control process.*
+
+
+## 3.x Production and Energy Formulas (Implemented)
+
+This section defines the formulas used by both the online tick (ResourceProductionSystem) and the offline accrual path (GameWorld._apply_offline_resource_accrual). The two paths are kept identical by design.
+
+Definitions (per planet):
+- L_mm, L_cm, L_ds: levels for metal_mine, crystal_mine, deuterium_synthesizer
+- L_sp: level for solar_plant
+- hours: elapsed hours since last update (can be fractional)
+- base_metal, base_crystal, base_deuterium:
+  - Default: ResourceProduction.metal_rate/crystal_rate/deuterium_rate
+  - If USE_CONFIG_PRODUCTION_RATES=true: src.core.config.BASE_PRODUCTION_RATES values
+- Planet multipliers: planet_mult = temperature_multiplier(Planet.temperature) * size_multiplier(Planet.size)  (defaults to 1.0 each)
+
+Energy production and consumption:
+- Energy tech bonus factor: energy_bonus = 1 + ENERGY_TECH_ENERGY_BONUS_PER_LEVEL * energy_level
+- Solar energy produced:
+  ENERGY_PRODUCED = ENERGY_SOLAR_BASE * L_sp * (ENERGY_SOLAR_GROWTH^(max(0, L_sp-1))) * energy_bonus
+- Energy required (sum over mines):
+  For each building with base consumption C and level L:
+  CONSUMPTION(L) = C * L * (ENERGY_CONSUMPTION_GROWTH^(max(0, L-1)))
+  ENERGY_REQUIRED = sum(CONSUMPTION_metal_mine, CONSUMPTION_crystal_mine, CONSUMPTION_deuterium_synthesizer)
+- Energy factor applied to production:
+  factor = 1                       if ENERGY_REQUIRED <= 0
+         = min(1, ENERGY_PRODUCED / ENERGY_REQUIRED) otherwise
+
+Resource production per resource R in {metal, crystal, deuterium}:
+- Effective hourly rate:
+  RATE_R = base_R * (1.1^L_Rmine) * factor * planet_mult
+- Accrued amount over elapsed time:
+  DELTA_R = round(RATE_R * hours)
+- Plasma research (level P) bonus multiplies post-rate:
+  DELTA_R := DELTA_R * (1 + PLASMA_PRODUCTION_BONUS[R] * P)
+
+Edge cases and notes:
+- If hours <= 0, no accrual occurs.
+- If ENERGY_REQUIRED > 0 and ENERGY_PRODUCED == 0, factor=0 and production halts.
+- Defaults preserve legacy behavior: ENERGY_SOLAR_GROWTH=1.0 and ENERGY_CONSUMPTION_GROWTH=1.0 yield linear energy curves; planet multipliers are 1.0.
+- Online and offline paths are intentionally mirrored to avoid drift.
+
+Example:
+- Given: base_metal=30, L_mm=3, L_sp=2, energy_level=1, ENERGY_SOLAR_BASE=20, ENERGY_TECH_ENERGY_BONUS_PER_LEVEL=0.02,
+  ENERGY_SOLAR_GROWTH=1.0 (linear), ENERGY_CONSUMPTION_GROWTH=1.0, C_metal_mine=3, hours=1.
+- ENERGY_PRODUCED = 20 * 2 * 1.0^(1) * (1 + 0.02*1) = 40 * 1.02 = 40.8
+- ENERGY_REQUIRED = 3 * L_mm = 9
+- factor = min(1, 40.8/9) = 1
+- RATE_metal = 30 * 1.1^3 * 1 * 1 = 30 * 1.331 = 39.93 -> DELTA ≈ 40 per hour (before plasma bonus).

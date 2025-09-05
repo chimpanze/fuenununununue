@@ -134,8 +134,52 @@ def clear_in_memory_notifications(user_id: Optional[int] = None) -> None:
         _inmem.pop(int(user_id), None)
 
 
+# Optional in-memory cooldown registry to limit spammy notifications
+# Keyed by (user_id, key or type) -> last_epoch_seconds
+_cooldown_last: Dict[tuple, float] = {}
+
+
+def create_notification_with_cooldown(
+    user_id: int,
+    ntype: str,
+    payload: Optional[Dict[str, Any]] = None,
+    priority: str = "normal",
+    cooldown_seconds: Optional[int] = None,
+    key: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Create a notification but enforce a cooldown window to avoid spam.
+
+    Args:
+        user_id: target player id
+        ntype: notification type string
+        payload: JSON-serializable payload
+        priority: priority label
+        cooldown_seconds: seconds to wait between repeated notifications for the same key
+        key: optional logical key to scope cooldown (e.g., f"planet:{ent}");
+             defaults to the type string if not provided.
+
+    Returns: the notification record if created; None if suppressed by cooldown.
+    """
+    try:
+        import time as _t
+        from src.core.config import ENERGY_DEFICIT_NOTIFICATION_COOLDOWN_SECONDS as _DEFAULT_CD  # lazy import
+    except Exception:
+        _DEFAULT_CD = 300
+        import time as _t  # type: ignore
+
+    cd = int(cooldown_seconds) if cooldown_seconds is not None else int(_DEFAULT_CD)
+    logical_key = (int(user_id), str(key or ntype))
+    now = _t.time()
+    last = _cooldown_last.get(logical_key, 0.0)
+    if last and (now - last) < cd:
+        return None
+    _cooldown_last[logical_key] = now
+    return create_notification(user_id, ntype, payload, priority)
+
+
 __all__ = [
     "create_notification",
+    "create_notification_with_cooldown",
     "get_in_memory_notifications",
     "clear_in_memory_notifications",
 ]

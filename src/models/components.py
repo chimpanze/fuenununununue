@@ -64,6 +64,13 @@ class Buildings:
     solar_plant: int = 1
     robot_factory: int = 0
     shipyard: int = 0
+    # Utility buildings
+    research_lab: int = 0
+    fusion_reactor: int = 0
+    # Storage capacity buildings
+    metal_storage: int = 0
+    crystal_storage: int = 0
+    deuterium_tank: int = 0
 
 
 @dataclass

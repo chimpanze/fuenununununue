@@ -388,11 +388,71 @@ async def get_game_status():
     except Exception:
         db_ok = False
 
+    # Compute aggregate energy status across loaded planets (best-effort)
+    try:
+        from src.models import Buildings as _Bld
+        from src.core.config import (
+            ENERGY_SOLAR_BASE as _E_BASE,
+            ENERGY_SOLAR_GROWTH as _E_GROWTH,
+            ENERGY_CONSUMPTION as _E_CONS,
+            ENERGY_CONSUMPTION_GROWTH as _E_CONS_GROWTH,
+            ENERGY_TECH_ENERGY_BONUS_PER_LEVEL as _E_BONUS,
+            ENERGY_DEFICIT_SOFT_FLOOR as _SOFT_FLOOR,
+        )
+        deficit_count = 0
+        total_planets = 0
+        min_factor = None
+        getter = getattr(game_world.world, "get_components", None)
+        if getter is None:
+            getter = game_world.world.get_components
+        for ent, (player, buildings) in getter(Player, _Bld):
+            total_planets += 1
+            # compute energy bonus via research if present
+            try:
+                research = game_world.world.component_for_entity(ent, Research)
+                energy_lvl = int(getattr(research, 'energy', 0))
+            except Exception:
+                energy_lvl = 0
+            bonus = 1.0 + (_E_BONUS * energy_lvl)
+            sp_lvl = max(0, int(getattr(buildings, 'solar_plant', 0)))
+            produced = (_E_BASE * sp_lvl * (_E_GROWTH ** max(0, sp_lvl - 1))) * bonus
+            def _cons(_base: float, _lvl: int) -> float:
+                _lvl = max(0, int(_lvl))
+                return _base * _lvl * (_E_CONS_GROWTH ** max(0, _lvl - 1))
+            required = 0.0
+            required += _cons(_E_CONS.get('metal_mine', 0.0), getattr(buildings, 'metal_mine', 0))
+            required += _cons(_E_CONS.get('crystal_mine', 0.0), getattr(buildings, 'crystal_mine', 0))
+            required += _cons(_E_CONS.get('deuterium_synthesizer', 0.0), getattr(buildings, 'deuterium_synthesizer', 0))
+            if required <= 0:
+                factor_raw = 1.0
+            elif produced <= 0:
+                factor_raw = 0.0
+            else:
+                factor_raw = min(1.0, produced / required)
+            if factor_raw < 1.0:
+                deficit_count += 1
+            if min_factor is None or factor_raw < min_factor:
+                min_factor = float(factor_raw)
+        energy_summary = {
+            "deficit_planets": int(deficit_count),
+            "total_planets": int(total_planets),
+            "min_factor": float(min_factor) if min_factor is not None else None,
+            "soft_floor": float(_SOFT_FLOOR),
+        }
+    except Exception:
+        energy_summary = {
+            "deficit_planets": 0,
+            "total_planets": 0,
+            "min_factor": None,
+            "soft_floor": None,
+        }
+
     return {
         "game_running": game_world.running,
         "total_entities": total_entities,
         "server_time": datetime.now().isoformat(),
         "database": {"status": "ok" if db_ok else "fail", "persistence": "db_only"},
+        "energy": energy_summary,
     }
 
 
@@ -573,6 +633,70 @@ async def build_ships(user_id: int, payload: dict, user=Depends(ensure_user_matc
         raise HTTPException(status_code=400, detail="quantity must be an integer")
     if quantity <= 0:
         raise HTTPException(status_code=400, detail="quantity must be > 0")
+
+    # Opportunistically compute validation against current ECS state for immediate errors
+    try:
+        # Progress world to settle any completions first
+        game_world._process_commands()
+        game_world.world.process()
+    except Exception:
+        pass
+
+    try:
+        from dataclasses import fields as _fields
+        from src.models import Player as _P, Buildings as _B, ShipBuildQueue as _SBQ, Fleet as _F, Research as _R
+        from src.core.config import SHIPYARD_QUEUE_BASE_LIMIT, SHIPYARD_QUEUE_PER_LEVEL, BASE_MAX_FLEET_SIZE, FLEET_SIZE_PER_COMPUTER_LEVEL
+        # Find the player's current entity
+        ent = None
+        shipyard_level = 0
+        queue_len = 0
+        total_current = 0
+        comp_lvl = 0
+        sbq = None
+        for e, (p, b, f) in game_world.world.get_components(_P, _B, _F):
+            if p.user_id != user_id:
+                continue
+            ent = e
+            shipyard_level = int(getattr(b, 'shipyard', 0))
+            # queue length
+            try:
+                sbq = game_world.world.component_for_entity(e, _SBQ)
+                if sbq and getattr(sbq, 'items', None):
+                    queue_len = len(sbq.items)
+            except Exception:
+                queue_len = 0
+            # current fleet sum
+            try:
+                for fld in _fields(_F):
+                    total_current += int(getattr(f, fld.name, 0))
+            except Exception:
+                pass
+            # add queued counts as part of cap check
+            if sbq and getattr(sbq, 'items', None):
+                for item in sbq.items:
+                    try:
+                        total_current += int(item.get('count', 0))
+                    except Exception:
+                        pass
+            # computer tech level
+            try:
+                r = game_world.world.component_for_entity(e, _R)
+                comp_lvl = int(getattr(r, 'computer', 0)) if r is not None else 0
+            except Exception:
+                comp_lvl = 0
+            break
+        if ent is not None:
+            queue_limit = int(SHIPYARD_QUEUE_BASE_LIMIT) + int(SHIPYARD_QUEUE_PER_LEVEL) * max(0, shipyard_level)
+            if queue_len >= queue_limit:
+                raise HTTPException(status_code=400, detail="Shipyard queue full")
+            max_allowed = int(BASE_MAX_FLEET_SIZE) + int(FLEET_SIZE_PER_COMPUTER_LEVEL) * max(0, comp_lvl)
+            if total_current + quantity > max_allowed:
+                raise HTTPException(status_code=400, detail="Fleet size cap exceeded")
+    except HTTPException:
+        raise
+    except Exception:
+        # Best effort only; fall through to command path
+        pass
 
     game_world.queue_command({
         'type': 'build_ships',
@@ -1527,3 +1651,27 @@ async def healthz_db():
             "status": "ok" if ok else "fail",
         }
     }
+
+
+# --- Market Guidance Endpoint ---
+@app.get("/market/guidance")
+async def get_market_guidance():
+    """Return soft guidance for market exchange ratios and current transaction fee rate.
+
+    Ratios express relative value weights for resources (metal:crystal:deuterium).
+    The fee rate is applied to the seller proceeds at acceptance time; buyer pays
+    the full requested amount. With default configuration, the fee is 0.0.
+    """
+    try:
+        # Local import to avoid widening global import list
+        from src.core.config import EXCHANGE_RATIOS as _RATIOS, TRADE_TRANSACTION_FEE_RATE as _FEE
+        ratios = {
+            "metal": float(_RATIOS.get("metal", 3.0)),
+            "crystal": float(_RATIOS.get("crystal", 2.0)),
+            "deuterium": float(_RATIOS.get("deuterium", 1.0)),
+        }
+        fee = float(_FEE)
+    except Exception:
+        ratios = {"metal": 3.0, "crystal": 2.0, "deuterium": 1.0}
+        fee = 0.0
+    return {"exchange_ratios": ratios, "transaction_fee_rate": fee}

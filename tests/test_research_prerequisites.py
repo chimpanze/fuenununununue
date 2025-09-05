@@ -4,9 +4,9 @@ from src.core.game import GameWorld
 from src.models import Player, Position, Resources, ResourceProduction, Buildings, BuildQueue, Fleet, Research, ResearchQueue, Planet
 
 
-def test_research_prerequisites_block_plasma_until_energy8():
+def test_research_prerequisites_block_plasma_until_energy8_and_ion5():
     gw = GameWorld()
-    # Create player with insufficient energy research
+    # Create player with insufficient ion research (energy ok)
     gw.world.create_entity(
         Player(name="TestR", user_id=10),
         Position(),
@@ -15,7 +15,7 @@ def test_research_prerequisites_block_plasma_until_energy8():
         Buildings(),
         BuildQueue(),
         Fleet(),
-        Research(energy=7),
+        Research(energy=8, ion=4),
         ResearchQueue(),
         Planet(name="Homeworld", owner_id=10),
     )
@@ -30,7 +30,7 @@ def test_research_prerequisites_block_plasma_until_energy8():
             break
 
 
-def test_research_prerequisites_allow_plasma_with_energy8():
+def test_research_prerequisites_allow_plasma_with_energy8_and_ion5():
     gw = GameWorld()
     # Provide ample resources to afford plasma level 1
     res = Resources(metal=100000, crystal=100000, deuterium=100000)
@@ -42,7 +42,7 @@ def test_research_prerequisites_allow_plasma_with_energy8():
         Buildings(),
         BuildQueue(),
         Fleet(),
-        Research(energy=8),
+        Research(energy=8, ion=5),
         ResearchQueue(),
         Planet(name="Homeworld", owner_id=11),
     )
